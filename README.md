@@ -1,15 +1,21 @@
-[![Buy Me a Coffee](https://img.shields.io/badge/donate-Buy%20Me%20a%20Coffee-blue.svg)](https://www.buymeacoffee.com/vschroeter) 
+[![Buy Me a Coffee](https://img.shields.io/badge/donate-Buy%20Me%20a%20Coffee-blue.svg)](https://www.buymeacoffee.com/vschroeter)
 [![PayPal](https://img.shields.io/badge/donate-PayPal-blue.svg)](https://paypal.me/valentinschroeter)
+
+# Obsidian Virtual Linker Plugin (Fork)
+
+> [!NOTE]
+> This is a fork of the original [Obsidian Virtual Linker Plugin](https://github.com/vschroeter/obsidian-virtual-linker) maintained by **Balduin Scheffbuch**.
 
 # Obsidian Virtual Linker Plugin (Glossary Plugin)
 
 This plugin automatically generates virtual links for text within your notes that match with the titles or aliases of other notes in your vault.
 
 Features:
+
 - create a glossary like functionality
 - works in **edit mode** and **read mode**
-- created links are **always up to date** 
-- **no manual linking** necessary 
+- created links are **always up to date**
+- **no manual linking** necessary
 - works with **aliases** of notes
 - links do not appear in graph view & reference counting
 - updates the links automatically while you expand your vault or type new text
@@ -25,7 +31,7 @@ All occurrences of a note title or alias will be linked in your current note tex
 If you only want to include notes of a specific folder, you can define this folder in the settings.
 
 > [!Note]
-> The auto generated links are post-processed, so they neither change your note text to hard-coded links enclosed in brackets not 
+> The auto generated links are post-processed, so they neither change your note text to hard-coded links enclosed in brackets not
 > appear in the graph view or reference counting.
 
 ## Installing the plugin
@@ -34,6 +40,7 @@ Inside obsidian, you can search for "Virtual Linker" in the community plugins ta
 After installing, enable the plugin in the settings.
 
 To manually install the plugin:
+
 - Copy over `main.js` & `manifest.json` (find them under `Releases`) to your vault `VaultFolder/.obsidian/plugins/virtual-linker/`.
 - or clone the repository into the plugins folder of your vault and build the plugin yourself.
 
@@ -42,10 +49,12 @@ To manually install the plugin:
 ## Matched files
 
 You can toggle the matching of files between:
+
 - "Match all files": All files in your vault are matched.
 - "Match only files in a specific folder": Only files in a specific folder are matched. You can specify the folder in the settings. This is useful if you want to only create virtual links to notes in a dedicated glossary directory.
 
 Furthermore, you can explicitly include or exclude specific files from being matched, by adding a tag to the file. You can change the tag in the settings, by default it is:
+
 - `linker-include` to explicitly include a file
 - `linker-exclude` to explicitly exclude a file
 
@@ -55,27 +64,33 @@ You can also exclude all files in a specific folder by adding the folder to the 
 > To include / exclude a file or folder, you can use the context menu on virtual links or in the file explorer.
 
 ### Case sensitivity
+
 You can toggle the case sensitivity of the matching. By default, the matching is case insensitive.
 
 Often there are words with mainly capitalized letters, that should be matched case sensitive. By default, words with 75% or more capitalized letters are matched case sensitive. You can change this threshold in the settings.
 
 You can also explicitly change the case sensitivity of a specific file by adding a tag to the file. You can change the tag in the settings, by default it is:
+
 - `linker-match-case` to make the matching case sensitive
 - `linker-ignore-case` to make the matching case insensitive
 
 If you want to define the case sensitivity for specific aliases, you can define the frontmatter property lists in a note:
+
 - `linker-match-case` with a list of names that should be matched only case sensitive
-- `linker-ignore-case` with a list of names that should be matched case insensitive 
+- `linker-ignore-case` with a list of names that should be matched case insensitive
 These property names can be changed in the settings.
 
 ### Matching mode
 
 #### Suppress multiple matching and matching to real links
+
 By default, the plugin will suppress several identical virtual link in the same note.
-Furthermore, you can toggle to suppress the creation of virtual links to files, that are linked by real links in the current note. 
+Furthermore, you can toggle to suppress the creation of virtual links to files, that are linked by real links in the current note.
 
 #### Part matching
+
 You can toggle the matching mode between:
+
 - "Matching only whole words": Only whole words are matched. E.g. "book" will not match "Notebook".
 - "Match also beginning of words": The beginning of a word is matched. E.g. "book" will not match "Notebook", but "Note" will match "Notebook".
 - "Matching any part of a word": Any part of a word is matched. E.g. "book" will match "Notebook".
@@ -83,17 +98,18 @@ You can toggle the matching mode between:
 You furthermore have the option to suppress the link suffix for these matches to avoid cluttering your text.
 
 #### Links to the note itself
+
 By default, links to a note itself are suppressed.
 This link suppression might be a bit buggy and not work in all cases, e.g. in preview windows.
 If you like self-links to the note itself, you can toggle this behavior in the settings.
 
-#### Link suppression in current line 
+#### Link suppression in current line
+
 By default, links are created directly as you type.
 You can disable links for the current line you are typing.
 
 > [!Note]
 > Deactivating the link creation for the current line is recommended when using the plugin with IME (input method editor) for languages like Chinese or Japanese, as the plugin might otherwise interfere with the IME.
-
 
 ### Styling of the links
 
