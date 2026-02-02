@@ -119,6 +119,7 @@ export class GlossaryLinker extends MarkdownRenderChild {
 
                                         matches.push(
                                             new VirtualMatch(
+                                                this.app,
                                                 id++,
                                                 name,
                                                 nFrom,

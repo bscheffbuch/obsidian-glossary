@@ -1,9 +1,10 @@
-import { App, EditorPosition, MarkdownView, Menu, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, TFolder } from 'obsidian';
+import { App, EditorPosition, MarkdownView, Menu, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, TFolder, WorkspaceLeaf } from 'obsidian';
 
 import { GlossaryLinker } from './linker/readModeLinker';
 import { liveLinkerPlugin } from './linker/liveLinker';
 import { ExternalUpdateManager, LinkerCache } from 'linker/linkerCache';
 import { LinkerMetaInfoFetcher } from 'linker/linkerInfo';
+import { GlossaryView, GLOSSARY_VIEW_TYPE } from './linker/GlossaryView';
 
 import * as path from 'path';
 
@@ -45,6 +46,7 @@ export interface LinkerPluginSettings {
     alwaysShowMultipleReferences: boolean;
     hideFrontmatterInHoverPreview: boolean;
     antialiasesEnabled: boolean;
+    openGlossaryLinksInSidebar: boolean;
     // wordBoundaryRegex: string;
     // wordBoundaryRegex: string;
     // conversionFormat
@@ -88,6 +90,7 @@ const DEFAULT_SETTINGS: LinkerPluginSettings = {
     alwaysShowMultipleReferences: false,
     hideFrontmatterInHoverPreview: true,
     antialiasesEnabled: true,
+    openGlossaryLinksInSidebar: false,
 
     // wordBoundaryRegex: '/[\\t- !-/:-@\\[-`{-~\\p{Emoji_Presentation}\\p{Extended_Pictographic}]/u',
 };
@@ -108,6 +111,33 @@ export default class LinkerPlugin extends Plugin {
             this.updateFrontmatterHidingClass();
         });
 
+        // Register the glossary sidebar view
+        this.registerView(
+            GLOSSARY_VIEW_TYPE,
+            (leaf) => new GlossaryView(leaf, this.settings, () => this.updateManager.update())
+        );
+
+        // Add ribbon icon to open glossary
+        this.addRibbonIcon('book-open', 'Open Glossary', () => {
+            this.activateGlossaryView();
+        });
+
+        // Register antialiases as a known property type with icon
+        // @ts-ignore - metadataTypeManager is internal API
+        if (this.app.metadataTypeManager) {
+            // @ts-ignore
+            this.app.metadataTypeManager.setType(this.settings.propertyNameAntialiases, 'multitext');
+            // Register a property info for rendering
+            // @ts-ignore
+            if (this.app.metadataTypeManager.properties) {
+                // @ts-ignore
+                this.app.metadataTypeManager.properties[this.settings.propertyNameAntialiases] = {
+                    name: this.settings.propertyNameAntialiases,
+                    type: 'multitext'
+                };
+            }
+        }
+
         // Register the glossary linker for the read mode
         this.registerMarkdownPostProcessor((element, context) => {
             context.addChild(new GlossaryLinker(this.app, this.settings, context, element));
@@ -121,6 +151,42 @@ export default class LinkerPlugin extends Plugin {
 
         // Context menu item to convert virtual links to real links
         this.registerEvent(this.app.workspace.on('file-menu', (menu, file, source) => this.addContextMenuItem(menu, file, source)));
+
+        // File watchers for auto-sync when glossary files change
+        this.registerEvent(this.app.vault.on('create', (file) => {
+            if (file instanceof TFile && file.extension === 'md') {
+                LinkerCache.getInstance(this.app, this.settings).clearCache();
+                this.updateManager.update();
+            }
+        }));
+
+        this.registerEvent(this.app.vault.on('delete', (file) => {
+            if (file instanceof TFile && file.extension === 'md') {
+                LinkerCache.getInstance(this.app, this.settings).clearCache();
+                this.updateManager.update();
+            }
+        }));
+
+        this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
+            if (file instanceof TFile && file.extension === 'md') {
+                LinkerCache.getInstance(this.app, this.settings).clearCache();
+                this.updateManager.update();
+            }
+        }));
+
+        this.registerEvent(this.app.metadataCache.on('changed', (file) => {
+            // Triggered when file metadata (frontmatter/aliases) changes
+            LinkerCache.getInstance(this.app, this.settings).clearCache();
+            this.updateManager.update();
+        }));
+
+        this.addCommand({
+            id: 'open-glossary-view',
+            name: 'Open Glossary',
+            callback: () => {
+                this.activateGlossaryView();
+            },
+        });
 
         this.addCommand({
             id: 'activate-virtual-linker',
@@ -275,6 +341,29 @@ export default class LinkerPlugin extends Plugin {
             (linkTo.line < selectionTo.line ||
                 (linkTo.line === selectionTo.line && linkTo.ch <= selectionTo.ch))
         );
+    }
+
+    async activateGlossaryView(): Promise<void> {
+        const { workspace } = this.app;
+
+        let leaf: WorkspaceLeaf | null = null;
+        const leaves = workspace.getLeavesOfType(GLOSSARY_VIEW_TYPE);
+
+        if (leaves.length > 0) {
+            // A leaf with our view already exists, use that
+            leaf = leaves[0];
+        } else {
+            // Create a new leaf in the right sidebar
+            leaf = workspace.getRightLeaf(false);
+            if (leaf) {
+                await leaf.setViewState({ type: GLOSSARY_VIEW_TYPE, active: true });
+            }
+        }
+
+        // Reveal the leaf in case it is in a collapsed sidebar
+        if (leaf) {
+            workspace.revealLeaf(leaf);
+        }
     }
 
     addContextMenuItem(menu: Menu, file: TAbstractFile, source: string) {
@@ -1060,6 +1149,17 @@ class LinkerSettingTab extends PluginSettingTab {
                     text.inputEl.addClass('linker-settings-text-box');
                 });
         }
+
+        new Setting(containerEl).setName('Glossary View').setHeading();
+
+        new Setting(containerEl)
+            .setName('Open glossary links in sidebar')
+            .setDesc('If enabled, clicking a glossary link in the editor (Live Preview or Reading view) will open the entry in the glossary sidebar instead of navigating to the file.')
+            .addToggle((toggle) =>
+                toggle.setValue(this.plugin.settings.openGlossaryLinksInSidebar).onChange(async (value) => {
+                    await this.plugin.updateSettings({ openGlossaryLinksInSidebar: value });
+                })
+            );
 
         new Setting(containerEl).setName('Link style').setHeading();
 

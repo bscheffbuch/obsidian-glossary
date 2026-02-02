@@ -37,6 +37,9 @@ export class LinkerMetaInfoFetcher {
     excludeDirPattern: RegExp;
     includeAllFiles: boolean;
 
+    // Cache for performance: path -> {info, mtime}
+    private cache: Map<string, { info: LinkerFileMetaInfo; mtime: number }> = new Map();
+
     constructor(public app: App, public settings: LinkerPluginSettings) {
         this.refreshSettings();
     }
@@ -44,11 +47,33 @@ export class LinkerMetaInfoFetcher {
     refreshSettings(settings?: LinkerPluginSettings) {
         this.settings = settings ?? this.settings;
         this.includeAllFiles = this.settings.includeAllFiles;
-        this.includeDirPattern = new RegExp(`(^|\/)(${this.settings.linkerDirectories.join("|")})\/`);
-        this.excludeDirPattern = new RegExp(`(^|\/)(${this.settings.excludedDirectories.join("|")})\/`);
+        this.includeDirPattern = new RegExp(`(^|\\/)(${this.settings.linkerDirectories.join("|")})\\/`);
+        this.excludeDirPattern = new RegExp(`(^|\\/)(${this.settings.excludedDirectories.join("|")})\\/`);
+        // Clear cache on settings change
+        this.cache.clear();
     }
 
-    getMetaInfo(file: TFile | TAbstractFile) {
-        return new LinkerFileMetaInfo(this, file);
+    clearCache() {
+        this.cache.clear();
+    }
+
+    getMetaInfo(file: TFile | TAbstractFile): LinkerFileMetaInfo {
+        const tfile = file instanceof TFile ? file : this.app.vault.getFileByPath(file.path) as TFile;
+        if (!tfile) {
+            return new LinkerFileMetaInfo(this, file);
+        }
+
+        const cached = this.cache.get(tfile.path);
+        const currentMtime = tfile.stat.mtime;
+
+        // Return cached if mtime hasn't changed
+        if (cached && cached.mtime === currentMtime) {
+            return cached.info;
+        }
+
+        // Create new and cache
+        const info = new LinkerFileMetaInfo(this, tfile);
+        this.cache.set(tfile.path, { info, mtime: currentMtime });
+        return info;
     }
 }

@@ -166,7 +166,7 @@ class AutoLinkerPlugin implements PluginValue {
                             // console.log("MATCH", name, aFrom, aTo, node.caseIsMatched, node.requiresCaseMatch)
 
                             matches.push(
-                                new VirtualMatch(id++, name, aFrom, aTo, Array.from(node.files), isAlias, !isWordBoundary, this.settings)
+                                new VirtualMatch(this.app, id++, name, aFrom, aTo, Array.from(node.files), isAlias, !isWordBoundary, this.settings)
                             );
                         }
                     }

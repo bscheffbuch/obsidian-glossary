@@ -1,9 +1,10 @@
 import IntervalTree from '@flatten-js/interval-tree';
 import { LinkerPluginSettings } from 'main';
-import { TFile } from 'obsidian';
+import { TFile, App } from 'obsidian';
 
 export class VirtualMatch {
     constructor(
+        public app: App,
         public id: number,
         public originText: string,
         public from: number,
@@ -12,7 +13,7 @@ export class VirtualMatch {
         public isAlias: boolean,
         public isSubWord: boolean,
         public settings: LinkerPluginSettings
-    ) {}
+    ) { }
 
     /////////////////////////////////////////////////
     // DOM methods
@@ -20,7 +21,7 @@ export class VirtualMatch {
 
     getCompleteLinkElement() {
         const span = this.getLinkRootSpan();
-        const firstPath = this.files.length > 0 ? this.files[0].path: ""; 
+        const firstPath = this.files.length > 0 ? this.files[0].path : "";
         span.appendChild(this.getLinkAnchorElement(this.originText, firstPath));
         if (this.files.length > 1) {
             if (!this.isSubWord) {
@@ -46,6 +47,32 @@ export class VirtualMatch {
         link.setAttribute('to', this.to.toString());
         link.setAttribute('origin-text', this.originText);
         link.classList.add('internal-link', 'virtual-link-a');
+
+        if (this.settings.openGlossaryLinksInSidebar && this.files.length > 0) {
+            link.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+
+                const leaves = this.app.workspace.getLeavesOfType('glossary-view');
+                if (leaves.length > 0) {
+                    const view = leaves[0].view as any;
+                    // Find the file that matches the href or just use the first file stored in this match
+                    // Href is file path.
+                    // Note: href passed here might be just path.
+                    // Let's rely on this.files[0] for primary link.
+                    // If this is a multiple-reference link (generated later), we might need to handle it there too.
+
+                    // For main link:
+                    const targetFile = this.files.find(f => f.path === href) || this.files[0];
+
+                    if (view && view.openEntry && targetFile) {
+                        view.openEntry(targetFile);
+                        this.app.workspace.revealLeaf(leaves[0]);
+                    }
+                }
+            });
+        }
+
         return link;
     }
 
