@@ -95,7 +95,7 @@ class AutoLinkerPlugin implements PluginValue {
         this.lastViewUpdate = update;
     }
 
-    destroy() {}
+    destroy() { }
 
     buildDecorations(view: EditorView, viewIsActive: boolean = true): DecorationSet {
         const builder = new RangeSetBuilder<Decoration>();
@@ -238,6 +238,16 @@ class AutoLinkerPlugin implements PluginValue {
             // Delete additions that overlap
             // Additions are sorted by from position and after that by length, we want to keep longer additions
             matches = VirtualMatch.filterOverlapping(matches, this.settings.onlyLinkOnce, excludedIntervalTree);
+
+            // Filter out matches where the surrounding word is an antialias
+            if (this.settings.antialiasesEnabled) {
+                const fullText = view.state.doc.sliceString(from, to);
+                matches = matches.filter((match) => {
+                    const matchStart = match.from - from;
+                    const matchEnd = match.to - from;
+                    return !this.linkerCache.cache.isMatchExcludedByAntialias(fullText, matchStart, matchEnd, match.files);
+                });
+            }
 
             // Store the files that are linked by a virtual link
             matches.forEach((addition) => addition.files.forEach((f) => alreadyLinkedFiles.add(f)));

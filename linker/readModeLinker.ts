@@ -154,6 +154,13 @@ export class GlossaryLinker extends MarkdownRenderChild {
                         // Additions are sorted by from position and after that by length, we want to keep longer additions
                         matches = VirtualMatch.filterOverlapping(matches, this.settings.onlyLinkOnce);
 
+                        // Filter out matches where the surrounding word is an antialias
+                        if (this.settings.antialiasesEnabled) {
+                            matches = matches.filter((match) => {
+                                return !this.linkerCache.cache.isMatchExcludedByAntialias(text, match.from, match.to, match.files);
+                            });
+                        }
+
                         const parent = childNode.parentElement;
                         let lastTo = 0;
                         // console.log("Parent: ", parent);

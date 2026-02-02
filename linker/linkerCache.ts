@@ -6,7 +6,7 @@ import { LinkerMetaInfoFetcher } from './linkerInfo';
 export class ExternalUpdateManager {
     registeredCallbacks: Set<Function> = new Set();
 
-    constructor() {}
+    constructor() { }
 
     registerCallback(callback: Function) {
         this.registeredCallbacks.add(callback);
@@ -67,6 +67,7 @@ export class PrefixTree {
     setIndexedFilePaths: Set<string> = new Set();
     mapIndexedFilePathsToUpdateTime: Map<string, number> = new Map();
     mapFilePathToLeaveNodes: Map<string, PrefixNode[]> = new Map();
+    mapFilePathToAntialiases: Map<string, Set<string>> = new Map();
 
     constructor(public app: App, public settings: LinkerPluginSettings) {
         this.fetcher = new LinkerMetaInfoFetcher(this.app, this.settings);
@@ -79,6 +80,7 @@ export class PrefixTree {
         this.setIndexedFilePaths.clear();
         this.mapIndexedFilePathsToUpdateTime.clear();
         this.mapFilePathToLeaveNodes.clear();
+        this.mapFilePathToAntialiases.clear();
     }
 
     getCurrentMatchNodes(index: number, excludedNote?: TFile | null): MatchNode[] {
@@ -188,7 +190,7 @@ export class PrefixTree {
         this.setIndexedFilePaths.add(path);
         this.mapIndexedFilePathsToUpdateTime.set(path, file.stat.mtime);
 
-        // Get the virtual linker related metadata of the file
+        // Get the glossary related metadata of the file
         const metaInfo = this.fetcher.getMetaInfo(file);
 
         // Get the tags of the file
@@ -251,6 +253,26 @@ export class PrefixTree {
         }
 
         names = names.filter(PrefixTree.isNoneEmptyString);
+
+        // Read anti-aliases from frontmatter
+        // Antialiases are words where the term should NOT match when appearing inside them
+        // E.g., if "nischen" has antialiases: [mechanischen], then "nischen" won't match inside "mechanischen"
+        let antialiasesRaw = metadata?.frontmatter?.[this.settings.propertyNameAntialiases] ?? [];
+        if (!Array.isArray(antialiasesRaw)) {
+            antialiasesRaw = [antialiasesRaw];
+        }
+        const antialiases: Set<string> = new Set(
+            antialiasesRaw
+                .filter(PrefixTree.isNoneEmptyString)
+                .map((t: string) => t.toLowerCase())
+        );
+
+        // Store antialiases for this file (used during match filtering)
+        if (antialiases.size > 0) {
+            this.mapFilePathToAntialiases.set(file.path, antialiases);
+        } else {
+            this.mapFilePathToAntialiases.delete(file.path);
+        }
 
         let namesWithCaseIgnore = new Array<string>();
         let namesWithCaseMatch = new Array<string>();
@@ -480,10 +502,44 @@ export class PrefixTree {
         const pattern = /[^\p{L}\p{N}]/u;
         return pattern.test(char);
     }
+
+    /**
+     * Check if a match should be excluded because the surrounding word is an antialias.
+     * @param fullText The complete text being searched
+     * @param matchStart The start position of the match
+     * @param matchEnd The end position of the match
+     * @param files The files that this match links to
+     * @returns true if the match should be excluded, false otherwise
+     */
+    isMatchExcludedByAntialias(fullText: string, matchStart: number, matchEnd: number, files: TFile[]): boolean {
+        // Extract the full word containing the match
+        let wordStart = matchStart;
+        let wordEnd = matchEnd;
+
+        // Expand to find word boundaries
+        while (wordStart > 0 && !PrefixTree.checkWordBoundary(fullText[wordStart - 1])) {
+            wordStart--;
+        }
+        while (wordEnd < fullText.length && !PrefixTree.checkWordBoundary(fullText[wordEnd])) {
+            wordEnd++;
+        }
+
+        const surroundingWord = fullText.substring(wordStart, wordEnd).toLowerCase();
+
+        // Check if the surrounding word is an antialias for any of the matched files
+        for (const file of files) {
+            const antialiases = this.mapFilePathToAntialiases.get(file.path);
+            if (antialiases && antialiases.has(surroundingWord)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
 }
 
 export class CachedFile {
-    constructor(public mtime: number, public file: TFile, public aliases: string[], public tags: string[]) {}
+    constructor(public mtime: number, public file: TFile, public aliases: string[], public tags: string[]) { }
 }
 
 export class LinkerCache {

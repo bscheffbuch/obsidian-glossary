@@ -33,6 +33,7 @@ export interface LinkerPluginSettings {
     tagToMatchCase: string;
     propertyNameToMatchCase: string;
     propertyNameToIgnoreCase: string;
+    propertyNameAntialiases: string;
     tagToExcludeFile: string;
     tagToIncludeFile: string;
     excludeLinksToOwnNote: boolean;
@@ -42,6 +43,9 @@ export interface LinkerPluginSettings {
     excludeLinksToRealLinkedFiles: boolean;
     includeAliases: boolean;
     alwaysShowMultipleReferences: boolean;
+    hideFrontmatterInHoverPreview: boolean;
+    antialiasesEnabled: boolean;
+    // wordBoundaryRegex: string;
     // wordBoundaryRegex: string;
     // conversionFormat
 }
@@ -72,6 +76,7 @@ const DEFAULT_SETTINGS: LinkerPluginSettings = {
     tagToMatchCase: 'linker-match-case',
     propertyNameToMatchCase: 'linker-match-case',
     propertyNameToIgnoreCase: 'linker-ignore-case',
+    propertyNameAntialiases: 'antialiases',
     tagToExcludeFile: 'linker-exclude',
     tagToIncludeFile: 'linker-include',
     excludeLinksToOwnNote: true,
@@ -81,7 +86,10 @@ const DEFAULT_SETTINGS: LinkerPluginSettings = {
     excludeLinksToRealLinkedFiles: true,
     includeAliases: true,
     alwaysShowMultipleReferences: false,
-    // wordBoundaryRegex: '/[\t- !-/:-@\[-`{-~\p{Emoji_Presentation}\p{Extended_Pictographic}]/u',
+    hideFrontmatterInHoverPreview: true,
+    antialiasesEnabled: true,
+
+    // wordBoundaryRegex: '/[\\t- !-/:-@\\[-`{-~\\p{Emoji_Presentation}\\p{Extended_Pictographic}]/u',
 };
 
 export default class LinkerPlugin extends Plugin {
@@ -91,9 +99,13 @@ export default class LinkerPlugin extends Plugin {
     async onload() {
         await this.loadSettings();
 
+        // Apply body class for conditional CSS (hide frontmatter in hover preview)
+        this.updateFrontmatterHidingClass();
+
         // Set callback to update the cache when the settings are changed
         this.updateManager.registerCallback(() => {
             LinkerCache.getInstance(this.app, this.settings).clearCache();
+            this.updateFrontmatterHidingClass();
         });
 
         // Register the glossary linker for the read mode
@@ -112,7 +124,7 @@ export default class LinkerPlugin extends Plugin {
 
         this.addCommand({
             id: 'activate-virtual-linker',
-            name: 'Activate Virtual Linker',
+            name: 'Activate Glossary',
             checkCallback: (checking) => {
                 if (!this.settings.linkerActivated) {
                     if (!checking) {
@@ -127,7 +139,7 @@ export default class LinkerPlugin extends Plugin {
 
         this.addCommand({
             id: 'deactivate-virtual-linker',
-            name: 'Deactivate Virtual Linker',
+            name: 'Deactivate Glossary',
             checkCallback: (checking) => {
                 if (this.settings.linkerActivated) {
                     if (!checking) {
@@ -184,7 +196,7 @@ export default class LinkerPlugin extends Plugin {
                 if (virtualLinks.length === 0) return;
 
                 // Process all links in a single operation
-                const replacements: {from: number, to: number, text: string}[] = [];
+                const replacements: { from: number, to: number, text: string }[] = [];
 
                 for (const link of virtualLinks) {
                     const targetFile = this.app.vault.getAbstractFileByPath(link.href);
@@ -225,8 +237,8 @@ export default class LinkerPlugin extends Plugin {
                         replacement = `[[${replacementPath}]]`;
                     } else {
                         const path = linkFormat === 'shortest' ? shortestPath :
-                                   linkFormat === 'relative' ? relativePath :
-                                   absolutePath;
+                            linkFormat === 'relative' ? relativePath :
+                                absolutePath;
 
                         replacement = useMarkdownLinks ?
                             `[${link.text}](${path})` :
@@ -259,9 +271,9 @@ export default class LinkerPlugin extends Plugin {
     ): boolean {
         return (
             (linkFrom.line > selectionFrom.line ||
-             (linkFrom.line === selectionFrom.line && linkFrom.ch >= selectionFrom.ch)) &&
+                (linkFrom.line === selectionFrom.line && linkFrom.ch >= selectionFrom.ch)) &&
             (linkTo.line < selectionTo.line ||
-             (linkTo.line === selectionTo.line && linkTo.ch <= selectionTo.ch))
+                (linkTo.line === selectionTo.line && linkTo.ch <= selectionTo.ch))
         );
     }
 
@@ -307,7 +319,7 @@ export default class LinkerPlugin extends Plugin {
                     menu.addItem((item) => {
                         // Item to convert a virtual link to a real link
                         item.setTitle(
-                            '[Virtual Linker] Converting link is not here.'
+                            '[Glossary] Converting link is not here.'
                         ).setIcon('link');
                     });
                 }
@@ -315,7 +327,7 @@ export default class LinkerPlugin extends Plugin {
                 else if (isVirtualLink) {
                     menu.addItem((item) => {
                         // Item to convert a virtual link to a real link
-                        item.setTitle('[Virtual Linker] Convert to real link')
+                        item.setTitle('[Glossary] Convert to real link')
                             .setIcon('link')
                             .onClick(() => {
                                 // Get from and to position from the element
@@ -425,7 +437,7 @@ export default class LinkerPlugin extends Plugin {
                 // Item to exclude a virtual link from the linker
                 // This action adds the settings.tagToExcludeFile to the file
                 menu.addItem((item) => {
-                    item.setTitle('[Virtual Linker] Exclude this file')
+                    item.setTitle('[Glossary] Exclude this file')
                         .setIcon('trash')
                         .onClick(async () => {
                             // Get the shown text
@@ -478,7 +490,7 @@ export default class LinkerPlugin extends Plugin {
                 //Item to include a virtual link from the linker
                 // This action adds the settings.tagToIncludeFile to the file
                 menu.addItem((item) => {
-                    item.setTitle('[Virtual Linker] Include this file')
+                    item.setTitle('[Glossary] Include this file')
                         .setIcon('plus')
                         .onClick(async () => {
                             // Get the shown text
@@ -540,7 +552,7 @@ export default class LinkerPlugin extends Plugin {
             // If the directory is in the linker directories, add the option to exclude it
             if ((fetcher.includeAllFiles && !isInExcludedDir) || isInIncludedDir) {
                 menu.addItem((item) => {
-                    item.setTitle('[Virtual Linker] Exclude this directory')
+                    item.setTitle('[Glossary] Exclude this directory')
                         .setIcon('trash')
                         .onClick(async () => {
                             // Get the shown text
@@ -564,7 +576,7 @@ export default class LinkerPlugin extends Plugin {
             } else if ((!fetcher.includeAllFiles && !isInIncludedDir) || isInExcludedDir) {
                 // If the directory is in the excluded directories, add the option to include it
                 menu.addItem((item) => {
-                    item.setTitle('[Virtual Linker] Include this directory')
+                    item.setTitle('[Glossary] Include this directory')
                         .setIcon('plus')
                         .onClick(async () => {
                             // Get the shown text
@@ -589,7 +601,7 @@ export default class LinkerPlugin extends Plugin {
         }
     }
 
-    onunload() {}
+    onunload() { }
 
     async loadSettings() {
         this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
@@ -610,6 +622,15 @@ export default class LinkerPlugin extends Plugin {
         await this.saveData(this.settings);
         this.updateManager.update();
     }
+
+    /** Toggle body class for hiding frontmatter in hover preview */
+    private updateFrontmatterHidingClass() {
+        if (this.settings.hideFrontmatterInHoverPreview) {
+            document.body.classList.add('virtual-linker-hide-frontmatter');
+        } else {
+            document.body.classList.remove('virtual-linker-hide-frontmatter');
+        }
+    }
 }
 
 class LinkerSettingTab extends PluginSettingTab {
@@ -623,7 +644,7 @@ class LinkerSettingTab extends PluginSettingTab {
         containerEl.empty();
 
         // Toggle to activate or deactivate the linker
-        new Setting(containerEl).setName('Activate Virtual Linker').addToggle((toggle) =>
+        new Setting(containerEl).setName('Activate Glossary').addToggle((toggle) =>
             toggle.setValue(this.plugin.settings.linkerActivated).onChange(async (value) => {
                 // console.log("Linker activated: " + value);
                 await this.plugin.updateSettings({ linkerActivated: value });
@@ -644,13 +665,40 @@ class LinkerSettingTab extends PluginSettingTab {
         // Toggle to include aliases
         new Setting(containerEl)
             .setName('Include aliases')
-            .setDesc('If activated, the virtual linker will also include aliases for the files.')
+            .setDesc('If activated, file aliases will also be used for generating links to glossary entries.')
             .addToggle((toggle) =>
                 toggle.setValue(this.plugin.settings.includeAliases).onChange(async (value) => {
                     // console.log("Include aliases: " + value);
                     await this.plugin.updateSettings({ includeAliases: value });
                 })
             );
+
+        // Toggle to enable/disable antialiases feature
+        new Setting(containerEl)
+            .setName('Exclude anti-aliases')
+            .setDesc(
+                'If enabled, words listed in the antialiases frontmatter property will prevent matches from appearing inside them.'
+            )
+            .addToggle((toggle) =>
+                toggle.setValue(this.plugin.settings.antialiasesEnabled).onChange(async (value) => {
+                    await this.plugin.updateSettings({ antialiasesEnabled: value });
+                    this.display();
+                })
+            );
+
+        // Text setting for property name for anti-aliases (only show if enabled)
+        if (this.plugin.settings.antialiasesEnabled) {
+            new Setting(containerEl)
+                .setName('Property name for anti-aliases')
+                .setDesc(
+                    'Words listed in this frontmatter property define contexts where the term should NOT match.'
+                )
+                .addText((text) =>
+                    text.setValue(this.plugin.settings.propertyNameAntialiases).onChange(async (value) => {
+                        await this.plugin.updateSettings({ propertyNameAntialiases: value });
+                    })
+                );
+        }
 
         if (this.plugin.settings.advancedSettings) {
             // Toggle to only link once
@@ -782,6 +830,8 @@ class LinkerSettingTab extends PluginSettingTab {
             // 	);
         }
 
+
+
         new Setting(containerEl).setName('Case sensitivity').setHeading();
 
         // Toggle setting for case sensitivity
@@ -871,13 +921,15 @@ class LinkerSettingTab extends PluginSettingTab {
                         await this.plugin.updateSettings({ propertyNameToMatchCase: value });
                     })
                 );
+
+
         }
 
         new Setting(containerEl).setName('Matched files').setHeading();
 
         new Setting(containerEl)
             .setName('Include all files')
-            .setDesc('Include all files for the virtual linker.')
+            .setDesc('Include all files for the glossary.')
             .addToggle((toggle) =>
                 toggle
                     // .setValue(true)
@@ -892,7 +944,7 @@ class LinkerSettingTab extends PluginSettingTab {
         if (!this.plugin.settings.includeAllFiles) {
             new Setting(containerEl)
                 .setName('Glossary linker directories')
-                .setDesc('Directories to include for the virtual linker (separated by new lines).')
+                .setDesc('Directories to include for the glossary (separated by new lines).')
                 .addTextArea((text) => {
                     let setValue = '';
                     try {
@@ -920,7 +972,7 @@ class LinkerSettingTab extends PluginSettingTab {
                 new Setting(containerEl)
                     .setName('Excluded directories')
                     .setDesc(
-                        'Directories from which files are to be excluded for the virtual linker (separated by new lines). Files in these directories will not create any virtual links in other files.'
+                        'Directories from which files are to be excluded for the glossary (separated by new lines). Files in these directories will not create links to glossary entries in other files.'
                     )
                     .addTextArea((text) => {
                         let setValue = '';
@@ -1050,6 +1102,18 @@ class LinkerSettingTab extends PluginSettingTab {
                 toggle.setValue(this.plugin.settings.applyDefaultLinkStyling).onChange(async (value) => {
                     // console.log("Apply default link styling: " + value);
                     await this.plugin.updateSettings({ applyDefaultLinkStyling: value });
+                })
+            );
+
+        // Toggle setting to hide frontmatter in hover preview
+        new Setting(containerEl)
+            .setName('Hide frontmatter in hover preview')
+            .setDesc(
+                'If toggled, the frontmatter (properties/metadata) will be hidden in hover preview popovers when hovering over virtual links.'
+            )
+            .addToggle((toggle) =>
+                toggle.setValue(this.plugin.settings.hideFrontmatterInHoverPreview).onChange(async (value) => {
+                    await this.plugin.updateSettings({ hideFrontmatterInHoverPreview: value });
                 })
             );
 

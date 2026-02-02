@@ -24,6 +24,7 @@ If your plugin does not need CSS, delete this file.
 .virtual-link-span:hover .multiple-files-references {
     display: inline;
 }
+
 .virtual-link-span:hover .multiple-files-indicator {
     display: none;
 }
@@ -34,4 +35,11 @@ If your plugin does not need CSS, delete this file.
 
 .multiple-files-indicator {
     display: inline;
+}
+
+/* Hide frontmatter/properties in hover preview popovers (when enabled via settings) */
+body.virtual-linker-hide-frontmatter .hover-popover .metadata-container,
+body.virtual-linker-hide-frontmatter .hover-popover .frontmatter,
+body.virtual-linker-hide-frontmatter .hover-popover .frontmatter-container {
+    display: none !important;
 }
