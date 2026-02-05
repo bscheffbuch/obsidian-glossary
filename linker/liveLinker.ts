@@ -6,7 +6,7 @@ import { App, MarkdownView, TFile, Vault } from 'obsidian';
 import IntervalTree from '@flatten-js/interval-tree';
 import { LinkerPluginSettings } from 'main';
 import { ExternalUpdateManager, LinkerCache, PrefixTree } from './linkerCache';
-import { VirtualMatch } from './virtualLinkDom';
+import { VirtualMatch, FormattingClass } from './virtualLinkDom';
 
 function isDescendant(parent: HTMLElement, child: HTMLElement, maxDepth: number = 10) {
     let node = child.parentNode;
@@ -186,6 +186,9 @@ class AutoLinkerPlugin implements PluginValue {
             const excludedIntervalTree = new IntervalTree();
             const excludedTypes = ['codeblock', 'code-block', 'inline-code', 'internal-link', 'link', 'url', 'hashtag'];
 
+            // Track formatting nodes (bold, italic, strikethrough, highlight)
+            const formattingIntervalTree = new IntervalTree<FormattingClass>();
+
             if (!this.settings.includeHeaders) {
                 excludedTypes.push('header-');
             }
@@ -200,6 +203,20 @@ class AutoLinkerPlugin implements PluginValue {
                     const types = type.split('_');
                     // const text = view.state.doc.sliceString(node.from, node.to);
                     // console.log(text, node.type.name, types, node.from, node.to)
+
+                    // Track formatting nodes for styling preservation
+                    if (type.includes('strong') || type.includes('bold')) {
+                        formattingIntervalTree.insert([node.from, node.to], 'virtual-link-bold');
+                    }
+                    if (type.includes('em') || type.includes('italic')) {
+                        formattingIntervalTree.insert([node.from, node.to], 'virtual-link-italic');
+                    }
+                    if (type.includes('strikethrough')) {
+                        formattingIntervalTree.insert([node.from, node.to], 'virtual-link-strikethrough');
+                    }
+                    if (type.includes('highlight')) {
+                        formattingIntervalTree.insert([node.from, node.to], 'virtual-link-highlight');
+                    }
 
                     for (const excludedType of excludedTypes) {
                         if (type.contains(excludedType)) {
@@ -305,6 +322,14 @@ class AutoLinkerPlugin implements PluginValue {
                 }
 
                 if (!cursorNearby && !needImeFix && !(excludeLine && additionIsInCurrentLine)) {
+                    // Look up formatting for this match
+                    const formattingResults = formattingIntervalTree.search([from, to]);
+                    if (formattingResults && formattingResults.length > 0) {
+                        // Extract unique formatting classes from the interval tree results
+                        const formattingClasses = [...new Set(formattingResults)] as FormattingClass[];
+                        addition.formattingClasses = formattingClasses;
+                    }
+
                     builder.add(
                         from,
                         to,

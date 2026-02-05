@@ -1,10 +1,11 @@
-import { App, EditorPosition, MarkdownView, Menu, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, TFolder, WorkspaceLeaf } from 'obsidian';
+import { App, EditorPosition, MarkdownView, Menu, Modal, Notice, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, TFolder, WorkspaceLeaf } from 'obsidian';
 
 import { GlossaryLinker } from './linker/readModeLinker';
 import { liveLinkerPlugin } from './linker/liveLinker';
 import { ExternalUpdateManager, LinkerCache } from 'linker/linkerCache';
 import { LinkerMetaInfoFetcher } from 'linker/linkerInfo';
 import { GlossaryView, GLOSSARY_VIEW_TYPE } from './linker/GlossaryView';
+import { AIEntryCreator } from './linker/aiEntryCreator';
 
 import * as path from 'path';
 
@@ -47,10 +48,75 @@ export interface LinkerPluginSettings {
     hideFrontmatterInHoverPreview: boolean;
     antialiasesEnabled: boolean;
     openGlossaryLinksInSidebar: boolean;
-    // wordBoundaryRegex: string;
+    // AI settings for glossary entry creation
+    aiEnabled: boolean;
+    aiActiveProvider: string;
+    aiProviders: AIProviderConfig[];
+    aiSystemPrompt: string;
+    aiMaxTokens: number;
+    // Metadata generation settings
+    aiGenerateMetadata: boolean;
+    aiMetadataModel: string;
+    aiMetadataSystemPrompt: string;
+    // Prompt variables
+    aiAllowedLanguages: string;
+    aiFallbackLanguage: string;
     // wordBoundaryRegex: string;
     // conversionFormat
 }
+
+export interface AIProviderConfig {
+    id: string;
+    name: string;
+    endpoint: string;
+    apiKey: string;
+    model: string;
+    modelsEndpoint?: string; // For fetching available models
+}
+
+// Default provider presets
+export const AI_PROVIDER_PRESETS: Omit<AIProviderConfig, 'apiKey'>[] = [
+    {
+        id: 'openai',
+        name: 'OpenAI',
+        endpoint: 'https://api.openai.com/v1/chat/completions',
+        model: 'gpt-4o-mini',
+        modelsEndpoint: 'https://api.openai.com/v1/models',
+    },
+    {
+        id: 'anthropic',
+        name: 'Anthropic',
+        endpoint: 'https://api.anthropic.com/v1/messages',
+        model: 'claude-3-haiku-20240307',
+    },
+    {
+        id: 'google',
+        name: 'Google Gemini',
+        endpoint: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',
+        model: 'gemini-2.0-flash',
+        modelsEndpoint: 'https://generativelanguage.googleapis.com/v1beta/openai/models',
+    },
+    {
+        id: 'openrouter',
+        name: 'OpenRouter',
+        endpoint: 'https://openrouter.ai/api/v1/chat/completions',
+        model: 'openai/gpt-4o-mini',
+        modelsEndpoint: 'https://openrouter.ai/api/v1/models',
+    },
+    {
+        id: 'ollama',
+        name: 'Ollama (Local)',
+        endpoint: 'http://localhost:11434/v1/chat/completions',
+        model: 'llama3.2',
+        modelsEndpoint: 'http://localhost:11434/v1/models',
+    },
+    {
+        id: 'custom',
+        name: 'Custom',
+        endpoint: '',
+        model: '',
+    },
+];
 
 const DEFAULT_SETTINGS: LinkerPluginSettings = {
     advancedSettings: false,
@@ -91,6 +157,75 @@ const DEFAULT_SETTINGS: LinkerPluginSettings = {
     hideFrontmatterInHoverPreview: true,
     antialiasesEnabled: true,
     openGlossaryLinksInSidebar: false,
+    // AI settings
+    aiEnabled: false,
+    aiActiveProvider: 'openai',
+    aiProviders: [],
+    aiSystemPrompt: `# Glossary Definition Generator
+
+Generate ONLY the definition content. Do NOT include frontmatter or YAML blocks.
+
+## Term Normalization
+* Use the **lemma** (dictionary) form of the term (singular, base form)
+* **Capitalize** the first letter unless the term is conventionally lowercase (e.g., pH, mRNA)
+* Keep scientific/technical notation intact
+
+## Output Format
+# <Term>
+
+<Definition paragraph>
+
+<Optional bullet points for additional details>
+
+## Language Logic
+* **Variables:** \`<Allowed_Languages>\` = [{{ALLOWED_LANGUAGES}}], \`<Fallback_Language>\` = {{FALLBACK_LANGUAGE}}
+* **Action:** Detect language of \`<Term>\`.
+* **Condition:**
+    * **IF** detected language is in \`<Allowed_Languages>\`: Output in detected language.
+    * **ELSE**: Output strictly in \`<Fallback_Language>\`.
+* **Constraint:** No mixed languages unless technical necessity.
+
+## Critical Style (Brevity & Density)
+* **Tone:** Clinical, directive, efficient.
+* **Sentence Structure:** Active voice. Minimal length.
+* **Lists:** **TELEGRAPHIC ONLY**. Noun phrases or fragments. **NO** full sentences.
+* **Redundancy:** **FORBIDDEN**. State facts once. Never summarize previous points.
+* **Explanation:** Zero fluff. No "This means that..." or "In other words...".
+* **Audience:** Novice. Simple terms. Zero assumptions.
+
+## Layout Logic
+* **Structure:** Definition first. Then Bullet points.
+* **Tables:** **Use only** for direct A/B comparisons. Else: Lists.
+* **Header:** NO "Definition:" prefix. Start immediately.
+
+## Math & Rendering (KaTeX)
+* **Syntax:** \`$...$\` (inline), \`$$...$$\` (block).
+* **Prohibition:** **NEVER** output raw \`$\`. **NEVER** escape \`$\`.
+* **Isolation:** No Markdown (\`**\`, \`_\`) around Math blocks.
+* **Color:** Use \`\\textcolor{color}{text}\` inside math (darkorange, cornflowerblue, teal, mediumorchid).
+
+## Pre-Flight Checklist
+1.  Is output language valid per \`<Allowed_Languages>\` logic?
+2.  Are all fillers removed?
+3.  Are lists fragments (not sentences)?
+4.  Is redundancy = 0?
+5.  Are \`$\` signs invisible (rendered)?`,
+    aiMaxTokens: 4000,
+    aiGenerateMetadata: false,
+    aiMetadataModel: '',
+    aiMetadataSystemPrompt: `Generate metadata for a glossary entry as a JSON object.
+
+Required fields:
+- title: Lemma form (singular, capitalized unless conventionally lowercase like pH, mRNA)
+- aliases: 2-5 common alternatives, plurals, synonyms, abbreviations (array of strings)
+- tags: Always include "glossary" plus 1-2 relevant topic tags (array of strings)
+
+Language: Match the input term's language if in [{{ALLOWED_LANGUAGES}}], else use {{FALLBACK_LANGUAGE}}.
+
+Return ONLY valid JSON. No markdown code blocks. No explanation. Example:
+{"title": "Term", "aliases": ["alt1", "alt2"], "tags": ["glossary", "topic"]}`,
+    aiAllowedLanguages: 'English, German',
+    aiFallbackLanguage: 'English',
 
     // wordBoundaryRegex: '/[\\t- !-/:-@\\[-`{-~\\p{Emoji_Presentation}\\p{Extended_Pictographic}]/u',
 };
@@ -151,6 +286,37 @@ export default class LinkerPlugin extends Plugin {
 
         // Context menu item to convert virtual links to real links
         this.registerEvent(this.app.workspace.on('file-menu', (menu, file, source) => this.addContextMenuItem(menu, file, source)));
+
+        // Editor context menu for AI glossary entry creation
+        this.registerEvent(this.app.workspace.on('editor-menu', (menu, editor, view) => {
+            if (this.settings.aiEnabled && editor.somethingSelected()) {
+                menu.addItem((item) => {
+                    item
+                        .setTitle('Create Glossary Entry with AI')
+                        .setIcon('sparkles')
+                        .onClick(async () => {
+                            const selectedText = editor.getSelection().trim();
+                            if (!selectedText) return;
+
+                            // Get surrounding context
+                            const from = editor.getCursor('from');
+                            const to = editor.getCursor('to');
+                            const startLine = Math.max(0, from.line - 2);
+                            const endLine = Math.min(editor.lineCount() - 1, to.line + 2);
+                            let context = '';
+                            for (let i = startLine; i <= endLine; i++) {
+                                context += editor.getLine(i) + '\n';
+                            }
+
+                            const aiCreator = new AIEntryCreator(this.app, this.settings);
+                            const file = await aiCreator.createEntryFromSelection(selectedText, context);
+                            if (file) {
+                                this.updateManager.update();
+                            }
+                        });
+                });
+            }
+        }));
 
         // File watchers for auto-sync when glossary files change
         this.registerEvent(this.app.vault.on('create', (file) => {
@@ -324,6 +490,41 @@ export default class LinkerPlugin extends Plugin {
                     const toPos = editor.offsetToPos(replacement.to);
                     editor.replaceRange(replacement.text, fromPos, toPos);
                 }
+            }
+        });
+
+        // AI-powered glossary entry creation command
+        this.addCommand({
+            id: 'create-glossary-entry-with-ai',
+            name: 'Create Glossary Entry with AI from Selection',
+            editorCheckCallback: (checking, editor, view) => {
+                if (!this.settings.aiEnabled) {
+                    return false;
+                }
+                if (!editor.somethingSelected()) {
+                    return false;
+                }
+                if (checking) return true;
+
+                const selectedText = editor.getSelection().trim();
+                if (!selectedText) return;
+
+                // Get surrounding context (2 lines before and after selection)
+                const from = editor.getCursor('from');
+                const to = editor.getCursor('to');
+                const startLine = Math.max(0, from.line - 2);
+                const endLine = Math.min(editor.lineCount() - 1, to.line + 2);
+                let context = '';
+                for (let i = startLine; i <= endLine; i++) {
+                    context += editor.getLine(i) + '\n';
+                }
+
+                const aiCreator = new AIEntryCreator(this.app, this.settings);
+                aiCreator.createEntryFromSelection(selectedText, context).then(file => {
+                    if (file) {
+                        this.updateManager.update();
+                    }
+                });
             }
         });
 
@@ -1257,5 +1458,329 @@ class LinkerSettingTab extends PluginSettingTab {
                         })
                 );
         }
+
+        // AI Settings Section
+        new Setting(containerEl).setName('AI-Powered Entry Creation').setHeading();
+
+        new Setting(containerEl)
+            .setName('Enable AI entry creation')
+            .setDesc('Enable the "Create Glossary Entry with AI" command which generates definitions using an AI model.')
+            .addToggle((toggle) =>
+                toggle.setValue(this.plugin.settings.aiEnabled).onChange(async (value) => {
+                    await this.plugin.updateSettings({ aiEnabled: value });
+                    this.display();
+                })
+            );
+
+        if (this.plugin.settings.aiEnabled) {
+            // Provider selection dropdown
+            new Setting(containerEl)
+                .setName('AI Provider')
+                .setDesc('Select your AI provider.')
+                .addDropdown((dropdown) => {
+                    AI_PROVIDER_PRESETS.forEach(preset => {
+                        dropdown.addOption(preset.id, preset.name);
+                    });
+                    dropdown
+                        .setValue(this.plugin.settings.aiActiveProvider)
+                        .onChange(async (value) => {
+                            await this.plugin.updateSettings({ aiActiveProvider: value });
+                            this.display();
+                        });
+                });
+
+            const activePreset = AI_PROVIDER_PRESETS.find(p => p.id === this.plugin.settings.aiActiveProvider);
+            const savedProvider = this.plugin.settings.aiProviders.find(p => p.id === this.plugin.settings.aiActiveProvider);
+            const currentConfig = savedProvider || (activePreset ? { ...activePreset, apiKey: '' } : null);
+
+            if (currentConfig) {
+                // Endpoint (editable for custom, readonly for presets)
+                new Setting(containerEl)
+                    .setName('API Endpoint')
+                    .setDesc('The API endpoint URL.')
+                    .addText((text) => {
+                        text
+                            .setPlaceholder('https://api.example.com/v1/chat/completions')
+                            .setValue(currentConfig.endpoint)
+                            .onChange(async (value) => {
+                                await this.updateProviderConfig({ endpoint: value });
+                            });
+                        if (this.plugin.settings.aiActiveProvider !== 'custom') {
+                            text.inputEl.style.opacity = '0.7';
+                        }
+                    });
+
+                // API Key
+                new Setting(containerEl)
+                    .setName('API Key')
+                    .setDesc('Your API key for authentication.')
+                    .addText((text) => {
+                        text
+                            .setPlaceholder('sk-... or your API key')
+                            .setValue(currentConfig.apiKey)
+                            .onChange(async (value) => {
+                                await this.updateProviderConfig({ apiKey: value });
+                            });
+                        text.inputEl.type = 'password';
+                    });
+
+                // Model with fetch button
+                const modelSetting = new Setting(containerEl)
+                    .setName('Model')
+                    .setDesc('The AI model to use. Click "Fetch" to load available models.');
+
+                let modelDropdown: any = null;
+                let modelInput: any = null;
+
+                modelSetting.addText((text) => {
+                    modelInput = text;
+                    text
+                        .setPlaceholder('gpt-4o-mini')
+                        .setValue(currentConfig.model)
+                        .onChange(async (value) => {
+                            await this.updateProviderConfig({ model: value });
+                        });
+                });
+
+                modelSetting.addButton((button) => {
+                    button
+                        .setButtonText('Fetch Models')
+                        .onClick(async () => {
+                            button.setButtonText('Loading...');
+                            button.setDisabled(true);
+
+                            const aiCreator = new AIEntryCreator(this.plugin.app, this.plugin.settings);
+                            const result = await aiCreator.fetchModels();
+
+                            if (result.success && result.models && result.models.length > 0) {
+                                // Show dropdown with models
+                                const modal = new ModelSelectModal(this.plugin.app, result.models, currentConfig.model, async (selected) => {
+                                    await this.updateProviderConfig({ model: selected });
+                                    if (modelInput) {
+                                        modelInput.setValue(selected);
+                                    }
+                                });
+                                modal.open();
+                            } else {
+                                new Notice(result.error || 'No models found');
+                            }
+
+                            button.setButtonText('Fetch Models');
+                            button.setDisabled(false);
+                        });
+                });
+
+                new Setting(containerEl)
+                    .setName('Max Output Tokens')
+                    .setDesc('Maximum number of tokens for the AI response. Increase this for models that do extended thinking (e.g. Gemini 3 Pro).')
+                    .addText((text) =>
+                        text
+                            .setValue(String(this.plugin.settings.aiMaxTokens))
+                            .onChange(async (value) => {
+                                const num = parseInt(value);
+                                if (!isNaN(num) && num > 0) {
+                                    await this.plugin.updateSettings({ aiMaxTokens: num });
+                                }
+                            })
+                    );
+            }
+
+            new Setting(containerEl)
+                .setName('System Prompt')
+                .setDesc('The system prompt used for generating definitions. Uses {{ALLOWED_LANGUAGES}} and {{FALLBACK_LANGUAGE}} variables.')
+                .addTextArea((text) => {
+                    text
+                        .setPlaceholder('Enter system prompt...')
+                        .setValue(this.plugin.settings.aiSystemPrompt)
+                        .onChange(async (value) => {
+                            await this.plugin.updateSettings({ aiSystemPrompt: value });
+                        });
+                    text.inputEl.rows = 6;
+                    text.inputEl.style.width = '100%';
+                    text.inputEl.style.minHeight = '150px';
+                    text.inputEl.classList.add('linker-settings-text-box');
+                })
+                .addExtraButton((btn) =>
+                    btn
+                        .setIcon('rotate-ccw')
+                        .setTooltip('Reset to default')
+                        .onClick(async () => {
+                            await this.plugin.updateSettings({ aiSystemPrompt: DEFAULT_SETTINGS.aiSystemPrompt });
+                            this.display();
+                        })
+                );
+
+            // Metadata Generation Section
+            new Setting(containerEl).setName('Metadata Generation (Optional)').setHeading();
+
+            new Setting(containerEl)
+                .setName('Generate separate metadata')
+                .setDesc('Use a potentially different model request to generate title and aliases.')
+                .addToggle((toggle) =>
+                    toggle.setValue(this.plugin.settings.aiGenerateMetadata).onChange(async (value) => {
+                        await this.plugin.updateSettings({ aiGenerateMetadata: value });
+                        this.display();
+                    })
+                );
+
+            if (this.plugin.settings.aiGenerateMetadata) {
+                new Setting(containerEl)
+                    .setName('Metadata Model')
+                    .setDesc('Model ID to use for metadata (e.g. "gemini-2.0-flash", "gpt-4o-mini"). Leave empty to use the main provider model.')
+                    .addText((text) =>
+                        text
+                            .setPlaceholder('Same as main model')
+                            .setValue(this.plugin.settings.aiMetadataModel)
+                            .onChange(async (value) => {
+                                await this.plugin.updateSettings({ aiMetadataModel: value });
+                            })
+                    );
+
+                new Setting(containerEl)
+                    .setName('Metadata System Prompt')
+                    .setDesc('Prompt for generating JSON metadata. Uses {{ALLOWED_LANGUAGES}} and {{FALLBACK_LANGUAGE}} variables.')
+                    .addTextArea((text) => {
+                        text
+                            .setValue(this.plugin.settings.aiMetadataSystemPrompt)
+                            .onChange(async (value) => {
+                                await this.plugin.updateSettings({ aiMetadataSystemPrompt: value });
+                            });
+                        text.inputEl.rows = 6;
+                        text.inputEl.style.width = '100%';
+                    })
+                    .addExtraButton((btn) =>
+                        btn
+                            .setIcon('rotate-ccw')
+                            .setTooltip('Reset to default')
+                            .onClick(async () => {
+                                await this.plugin.updateSettings({ aiMetadataSystemPrompt: DEFAULT_SETTINGS.aiMetadataSystemPrompt });
+                                this.display();
+                            })
+                    );
+            }
+
+            // Language Variables Section
+            new Setting(containerEl).setName('Prompt Variables').setHeading();
+
+            new Setting(containerEl)
+                .setName('Allowed Languages')
+                .setDesc('Comma-separated list of languages the AI can output in. Used in {{ALLOWED_LANGUAGES}} placeholder.')
+                .addText((text) =>
+                    text
+                        .setPlaceholder('English, German, Spanish')
+                        .setValue(this.plugin.settings.aiAllowedLanguages)
+                        .onChange(async (value) => {
+                            await this.plugin.updateSettings({ aiAllowedLanguages: value });
+                        })
+                );
+
+            new Setting(containerEl)
+                .setName('Fallback Language')
+                .setDesc("Default language if the term's language is not in the allowed list. Used in {{FALLBACK_LANGUAGE}}.")
+                .addText((text) =>
+                    text
+                        .setPlaceholder('English')
+                        .setValue(this.plugin.settings.aiFallbackLanguage)
+                        .onChange(async (value) => {
+                            await this.plugin.updateSettings({ aiFallbackLanguage: value });
+                        })
+                );
+        }
+    }
+
+    /**
+     * Update the current provider configuration
+     */
+    private async updateProviderConfig(updates: Partial<AIProviderConfig>) {
+        const providerId = this.plugin.settings.aiActiveProvider;
+        const providers = [...this.plugin.settings.aiProviders];
+        const existingIndex = providers.findIndex(p => p.id === providerId);
+
+        const preset = AI_PROVIDER_PRESETS.find(p => p.id === providerId);
+        const base = existingIndex >= 0 ? providers[existingIndex] : (preset ? { ...preset, apiKey: '' } : null);
+
+        if (!base) return;
+
+        const updated = { ...base, ...updates };
+
+        if (existingIndex >= 0) {
+            providers[existingIndex] = updated;
+        } else {
+            providers.push(updated);
+        }
+
+        await this.plugin.updateSettings({ aiProviders: providers });
+    }
+}
+
+// Simple modal for model selection
+class ModelSelectModal extends Modal {
+    constructor(
+        app: App,
+        private models: string[],
+        private currentModel: string,
+        private onSelect: (model: string) => void
+    ) {
+        super(app);
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+        contentEl.createEl('h2', { text: 'Select Model' });
+
+        const searchInput = contentEl.createEl('input', {
+            type: 'text',
+            placeholder: 'Search models...',
+            cls: 'linker-model-search'
+        });
+        searchInput.style.width = '100%';
+        searchInput.style.marginBottom = '10px';
+        searchInput.style.padding = '8px';
+
+        const listContainer = contentEl.createDiv({ cls: 'linker-model-list' });
+        listContainer.style.maxHeight = '300px';
+        listContainer.style.overflowY = 'auto';
+
+        const renderList = (filter: string) => {
+            listContainer.empty();
+            const filtered = this.models.filter(m => m.toLowerCase().includes(filter.toLowerCase()));
+
+            filtered.forEach(model => {
+                const item = listContainer.createDiv({ cls: 'linker-model-item' });
+                item.style.padding = '8px';
+                item.style.cursor = 'pointer';
+                item.style.borderRadius = '4px';
+                if (model === this.currentModel) {
+                    item.style.backgroundColor = 'var(--interactive-accent)';
+                    item.style.color = 'var(--text-on-accent)';
+                }
+                item.textContent = model;
+
+                item.addEventListener('click', () => {
+                    this.onSelect(model);
+                    this.close();
+                });
+
+                item.addEventListener('mouseenter', () => {
+                    if (model !== this.currentModel) {
+                        item.style.backgroundColor = 'var(--background-modifier-hover)';
+                    }
+                });
+                item.addEventListener('mouseleave', () => {
+                    if (model !== this.currentModel) {
+                        item.style.backgroundColor = '';
+                    }
+                });
+            });
+        };
+
+        renderList('');
+        searchInput.addEventListener('input', () => renderList(searchInput.value));
+        searchInput.focus();
+    }
+
+    onClose() {
+        this.contentEl.empty();
     }
 }

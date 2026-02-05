@@ -2,6 +2,8 @@ import IntervalTree from '@flatten-js/interval-tree';
 import { LinkerPluginSettings } from 'main';
 import { TFile, App } from 'obsidian';
 
+export type FormattingClass = 'virtual-link-bold' | 'virtual-link-italic' | 'virtual-link-strikethrough' | 'virtual-link-highlight';
+
 export class VirtualMatch {
     constructor(
         public app: App,
@@ -12,7 +14,8 @@ export class VirtualMatch {
         public files: TFile[],
         public isAlias: boolean,
         public isSubWord: boolean,
-        public settings: LinkerPluginSettings
+        public settings: LinkerPluginSettings,
+        public formattingClasses: FormattingClass[] = []
     ) { }
 
     /////////////////////////////////////////////////
@@ -82,6 +85,8 @@ export class VirtualMatch {
         if (this.settings.applyDefaultLinkStyling) {
             span.classList.add('virtual-link-default');
         }
+        // Apply formatting classes to preserve bold/italic/etc.
+        this.formattingClasses.forEach(cls => span.classList.add(cls));
         return span;
     }
 

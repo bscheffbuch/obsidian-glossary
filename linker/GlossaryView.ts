@@ -8,6 +8,25 @@ type SortField = 'name' | 'modified';
 type SortDirection = 'asc' | 'desc';
 type ViewMode = 'list' | 'preview';
 
+/**
+ * Normalize a character to its base letter (Ä→A, É→E, Ñ→N, etc.)
+ */
+function normalizeToBaseLetter(char: string): string {
+    // Normalize to NFD (decomposed form) and remove combining diacritical marks
+    const normalized = char.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    return normalized.toUpperCase();
+}
+
+/**
+ * Get the letter group for a name (handles umlauts and special characters)
+ */
+function getLetterGroup(name: string): string {
+    if (!name) return '#';
+    const firstChar = name.charAt(0);
+    const baseLetter = normalizeToBaseLetter(firstChar);
+    return /[A-Z]/.test(baseLetter) ? baseLetter : '#';
+}
+
 interface GlossaryEntry {
     file: TFile;
     name: string;
@@ -381,8 +400,7 @@ export class GlossaryView extends ItemView {
                 let currentLetter = '';
                 for (let i = 0; i < entriesToRender.length; i++) {
                     const entry = entriesToRender[i];
-                    const firstChar = entry.name.charAt(0).toUpperCase();
-                    const letter = /[A-Z]/.test(firstChar) ? firstChar : '#';
+                    const letter = getLetterGroup(entry.name);
 
                     if (letter !== currentLetter) {
                         // Add letter header
@@ -471,8 +489,7 @@ export class GlossaryView extends ItemView {
     private groupByLetter(entries: GlossaryEntry[]): GroupedEntries {
         const grouped: GroupedEntries = {};
         for (const entry of entries) {
-            const firstChar = entry.name.charAt(0).toUpperCase();
-            const letter = /[A-Z]/.test(firstChar) ? firstChar : '#';
+            const letter = getLetterGroup(entry.name);
             if (!grouped[letter]) grouped[letter] = [];
             grouped[letter].push(entry);
         }

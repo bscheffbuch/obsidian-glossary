@@ -11,6 +11,36 @@ If your plugin does not need CSS, delete this file.
     filter: brightness(0.6);
 }
 
+/* Preserve text formatting (bold, italic, etc.) on virtual links */
+.virtual-link,
+.virtual-link-span,
+.virtual-link-a {
+    font-weight: inherit;
+    font-style: inherit;
+    text-decoration: inherit;
+}
+
+/* Explicit formatting classes for live preview mode */
+.virtual-link-bold,
+.virtual-link-bold .virtual-link-a {
+    font-weight: bold;
+}
+
+.virtual-link-italic,
+.virtual-link-italic .virtual-link-a {
+    font-style: italic;
+}
+
+.virtual-link-strikethrough,
+.virtual-link-strikethrough .virtual-link-a {
+    text-decoration: line-through;
+}
+
+.virtual-link-highlight,
+.virtual-link-highlight .virtual-link-a {
+    background-color: var(--text-highlight-bg);
+}
+
 .linker-suffix-icon {
     user-select: none;
 }
