@@ -13,6 +13,13 @@ export interface ModelListResult {
     error?: string;
 }
 
+interface GlossaryMetadata {
+    title?: string;
+    aliases?: string[];
+    antialiases?: string[];
+    exactMatchOnly?: boolean;
+}
+
 /**
  * Floating preview panel for streaming AI responses
  */
@@ -169,6 +176,11 @@ export class AIEntryCreator {
      */
     private getEffectiveSystemPrompt(): string {
         const definitionPrompt = this.substitutePromptVariables(this.settings.aiSystemPrompt);
+        const exactPropertyName = this.settings.propertyNameExactMatchOnly || 'linker-exact-match-only';
+        const antialiasPropertyName = this.settings.propertyNameAntialiases || 'antialiases';
+        const frontmatterInstruction =
+            `When YAML frontmatter is requested, include "${exactPropertyName}: false" by default (set true only for strict matching) ` +
+            `and include "${antialiasPropertyName}: []" by default.`;
 
         if (this.settings.aiGenerateMetadata) {
             // Separate metadata generation - definition prompt only (no frontmatter)
@@ -176,8 +188,31 @@ export class AIEntryCreator {
         } else {
             // Single request - merge metadata prompt with definition prompt
             const metadataPrompt = this.substitutePromptVariables(this.settings.aiMetadataSystemPrompt);
-            return `${metadataPrompt}\n\n---\n\n${definitionPrompt}\n\nIMPORTANT: Include YAML frontmatter (with --- delimiters) at the start of your response, followed by the definition content.`;
+            return `${metadataPrompt}\n\n---\n\n${definitionPrompt}\n\nIMPORTANT: Include YAML frontmatter (with --- delimiters) at the start of your response, followed by the definition content.\n${frontmatterInstruction}`;
         }
+    }
+
+    private parseBooleanLike(value: unknown): boolean | undefined {
+        if (typeof value === 'boolean') {
+            return value;
+        }
+        if (typeof value === 'number') {
+            return value !== 0;
+        }
+        if (typeof value === 'string') {
+            const normalized = value.trim().toLowerCase();
+            if (normalized === 'true' || normalized === 'yes' || normalized === '1' || normalized === 'on') {
+                return true;
+            }
+            if (normalized === 'false' || normalized === 'no' || normalized === '0' || normalized === 'off') {
+                return false;
+            }
+        }
+        return undefined;
+    }
+
+    private escapeRegExp(input: string): string {
+        return input.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     }
 
     getActiveProvider(): AIProviderConfig | null {
@@ -272,8 +307,6 @@ Language settings: Allowed languages are [${languages}]. If the term is not in o
                 };
             }
 
-            console.log('[AI Request]', { url: provider.endpoint, body });
-
             // Longer timeout for models with extended thinking (2 minutes)
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), 120000);
@@ -287,8 +320,6 @@ Language settings: Allowed languages are [${languages}]. If the term is not in o
             });
 
             clearTimeout(timeoutId);
-            console.log('[AI Response Status]', response.status, response.statusText);
-
             if (!response.ok) {
                 const errorText = await response.text();
                 console.error('[AI Error Response]', errorText);
@@ -306,8 +337,6 @@ Language settings: Allowed languages are [${languages}]. If the term is not in o
 
             const decoder = new TextDecoder();
             let lineBuffer = '';  // Buffer for incomplete lines
-            console.log('[AI Streaming] Starting...');
-
             while (true) {
                 const { done, value } = await reader.read();
                 if (done) break;
@@ -364,7 +393,6 @@ Language settings: Allowed languages are [${languages}]. If the term is not in o
                 }
             }
 
-            console.log('[AI Final Content]', fullContent);
             statusEl?.remove();
 
             if (!fullContent.trim()) {
@@ -420,11 +448,8 @@ Language settings: Allowed languages are [${languages}]. If the term is not in o
                 };
             }
 
-            console.log('[AI Request]', { url: provider.endpoint, body });
             const response = await requestUrl({ url: provider.endpoint, method: 'POST', headers, body: JSON.stringify(body) });
             const data = response.json;
-            console.log('[AI Response]', JSON.stringify(data, null, 2));
-            console.log('[AI Choices]', JSON.stringify(data.choices, null, 2));
 
             let definition: string | undefined;
             if (provider.id === 'anthropic') {
@@ -436,7 +461,6 @@ Language settings: Allowed languages are [${languages}]. If the term is not in o
                     || choice?.text?.trim()
                     || choice?.content?.trim();
 
-                console.log('[AI Choice structure]', Object.keys(choice || {}));
             }
 
             if (!definition) {
@@ -450,7 +474,7 @@ Language settings: Allowed languages are [${languages}]. If the term is not in o
         }
     }
 
-    async generateMetadata(term: string, context: string): Promise<{ title?: string; aliases?: string[] } | null> {
+    async generateMetadata(term: string, context: string): Promise<GlossaryMetadata | null> {
         if (!this.settings.aiEnabled || !this.settings.aiGenerateMetadata) return null;
 
         const provider = this.getActiveProvider();
@@ -497,14 +521,10 @@ Allowed languages: [${languages}]. Fallback: ${fallback}.`;
                 };
             }
 
-            console.log('[AI Metadata Request]', { url: provider.endpoint, body });
             const response = await requestUrl({ url: provider.endpoint, method: 'POST', headers, body: JSON.stringify(body) });
             const data = response.json;
 
             let contentStr: string | undefined;
-            console.log('[AI Metadata Raw Response]', data);
-            console.log('[AI Metadata Choices]', data.choices);
-            console.log('[AI Metadata Choice[0]]', JSON.stringify(data.choices?.[0], null, 2));
 
             if (provider.id === 'anthropic') {
                 contentStr = data.content?.[0]?.text;
@@ -515,13 +535,10 @@ Allowed languages: [${languages}]. Fallback: ${fallback}.`;
                     || data.choices?.[0]?.delta?.content;
             }
 
-            console.log('[AI Metadata contentStr]', contentStr);
             if (!contentStr) {
                 console.error('[AI Metadata] No content in response');
                 return null;
             }
-
-            console.log('[AI Metadata Response]', contentStr);
 
             // Clean and extract JSON from response
             let jsonStr = contentStr.trim();
@@ -544,9 +561,11 @@ Allowed languages: [${languages}]. Fallback: ${fallback}.`;
                 metadata = JSON.parse(jsonStr);
             } catch (jsonError) {
                 // Fallback: Try to extract title and aliases from YAML-like format
-                console.log('[AI Metadata] JSON parse failed, trying YAML extraction');
                 const titleMatch = jsonStr.match(/title:\s*["']?([^"'\n]+)["']?/);
                 const aliasesMatch = jsonStr.match(/aliases:\s*\[([\s\S]*?)\]/);
+                const antialiasesMatch = jsonStr.match(/antialiases:\s*\[([\s\S]*?)\]/i);
+                const exactMatchOnlyMatch = jsonStr.match(/exactMatchOnly:\s*([^\n]+)/i);
+                const exactFrontmatterMatch = jsonStr.match(new RegExp(`${this.escapeRegExp(this.settings.propertyNameExactMatchOnly)}\\s*:\\s*([^\\n]+)`, 'i'));
 
                 if (titleMatch) {
                     const aliases: string[] = [];
@@ -557,16 +576,35 @@ Allowed languages: [${languages}]. Fallback: ${fallback}.`;
                             aliases.push(...aliasMatches.map(a => a.replace(/["']/g, '')));
                         }
                     }
-                    metadata = { title: titleMatch[1].trim(), aliases };
+                    const antialiases: string[] = [];
+                    if (antialiasesMatch) {
+                        const antialiasContent = antialiasesMatch[1];
+                        const antialiasItems = antialiasContent.match(/["']([^"']+)["']/g);
+                        if (antialiasItems) {
+                            antialiases.push(...antialiasItems.map(a => a.replace(/["']/g, '')));
+                        }
+                    }
+                    metadata = {
+                        title: titleMatch[1].trim(),
+                        aliases,
+                        antialiases,
+                        exactMatchOnly: this.parseBooleanLike(exactMatchOnlyMatch?.[1]) ?? this.parseBooleanLike(exactFrontmatterMatch?.[1]),
+                    };
                 } else {
                     console.error('[AI Metadata] Could not parse response:', jsonStr);
                     return null;
                 }
             }
 
+            const exactFromNamedField = this.parseBooleanLike(metadata.exactMatchOnly);
+            const exactFromFrontmatterField = this.parseBooleanLike(metadata[this.settings.propertyNameExactMatchOnly]);
+            const exactFromDefaultField = this.parseBooleanLike(metadata['linker-exact-match-only']);
+
             return {
                 title: metadata.title,
-                aliases: Array.isArray(metadata.aliases) ? metadata.aliases : []
+                aliases: Array.isArray(metadata.aliases) ? metadata.aliases : [],
+                antialiases: Array.isArray(metadata.antialiases) ? metadata.antialiases : [],
+                exactMatchOnly: exactFromNamedField ?? exactFromFrontmatterField ?? exactFromDefaultField,
             };
         } catch (error) {
             console.error('[AI Metadata Error]', error);
@@ -574,7 +612,7 @@ Allowed languages: [${languages}]. Fallback: ${fallback}.`;
         }
     }
 
-    async createGlossaryEntry(term: string, definition: string, metadata?: { title?: string; aliases?: string[] }): Promise<TFile | null> {
+    async createGlossaryEntry(term: string, definition: string, metadata?: GlossaryMetadata): Promise<TFile | null> {
         const targetFolder = this.settings.linkerDirectories[0] || 'Glossary';
 
         // ============================================
@@ -658,24 +696,12 @@ Allowed languages: [${languages}]. Fallback: ${fallback}.`;
         const metadataAliases = (metadata?.aliases || []).filter(a => a && a !== title);
 
         // Add original term as alias if it differs from the title (case-insensitive comparison)
-        console.log('[Alias Debug] term:', term, 'title:', title);
-        console.log('[Alias Debug] metadata?.aliases:', metadata?.aliases);
-        console.log('[Alias Debug] metadataAliases (filtered):', metadataAliases);
-
         if (term.toLowerCase() !== title.toLowerCase() && !metadataAliases.some(a => a.toLowerCase() === term.toLowerCase())) {
-            console.log('[Alias Debug] Adding original term as alias');
             metadataAliases.unshift(term);
-        } else {
-            console.log('[Alias Debug] NOT adding term - same as title or already in aliases');
         }
-
-        console.log('[Alias Debug] Final metadataAliases:', metadataAliases);
 
         // Construct final frontmatter
         let finalFrontmatter = '';
-
-        console.log('[Alias Debug] extractedFrontmatter:', extractedFrontmatter);
-        console.log('[Alias Debug] extractedFrontmatter includes aliases?', extractedFrontmatter.includes('aliases:'));
 
         if (extractedFrontmatter) {
             // Check if aliases already exist in extracted frontmatter to avoid duplicates or overwriting
@@ -690,7 +716,23 @@ Allowed languages: [${languages}]. Fallback: ${fallback}.`;
                 : `aliases: []`;
         }
 
-        console.log('[Alias Debug] finalFrontmatter:', finalFrontmatter);
+        const exactPropertyName = this.settings.propertyNameExactMatchOnly || 'linker-exact-match-only';
+        const hasExactProperty = new RegExp(`^\\s*${this.escapeRegExp(exactPropertyName)}\\s*:`, 'm').test(finalFrontmatter);
+        if (!hasExactProperty) {
+            const exactMatchOnly = metadata?.exactMatchOnly === true;
+            finalFrontmatter += `\n${exactPropertyName}: ${exactMatchOnly ? 'true' : 'false'}`;
+        }
+
+        const antialiasPropertyName = this.settings.propertyNameAntialiases || 'antialiases';
+        const hasAntialiasProperty = new RegExp(`^\\s*${this.escapeRegExp(antialiasPropertyName)}\\s*:`, 'm').test(finalFrontmatter);
+        if (!hasAntialiasProperty) {
+            const antialiases = Array.isArray(metadata?.antialiases) ? metadata!.antialiases!.filter(Boolean) : [];
+            if (antialiases.length > 0) {
+                finalFrontmatter += `\n${antialiasPropertyName}:\n${antialiases.map(a => `  - "${a}"`).join('\n')}`;
+            } else {
+                finalFrontmatter += `\n${antialiasPropertyName}: []`;
+            }
+        }
 
         // Build final content - ensure no leading/trailing whitespace
         const content = `---
@@ -717,7 +759,7 @@ ${cleanDefinition.trim()}
 
         // Run definition and metadata generation in parallel if enabled
         const definitionPromise = this.generateDefinitionStreaming(term, context);
-        let metadataPromise: Promise<{ title?: string; aliases?: string[] } | null> = Promise.resolve(null);
+        let metadataPromise: Promise<GlossaryMetadata | null> = Promise.resolve(null);
 
         if (this.settings.aiGenerateMetadata) {
             metadataPromise = this.generateMetadata(term, context);

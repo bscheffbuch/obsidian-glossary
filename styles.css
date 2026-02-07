@@ -74,6 +74,52 @@ body.virtual-linker-hide-frontmatter .hover-popover .frontmatter-container {
     display: none !important;
 }
 
+/* Glossary callout style */
+.callout[data-callout="glossary"] {
+    --callout-color: var(--color-accent-rgb);
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 10px;
+    background:
+        linear-gradient(
+            135deg,
+            rgba(var(--color-accent-rgb), 0.12) 0%,
+            rgba(var(--color-accent-rgb), 0.05) 45%,
+            var(--background-secondary) 100%
+        );
+    box-shadow: 0 1px 0 rgba(var(--mono-rgb-100), 0.08);
+}
+
+.callout[data-callout="glossary"] .callout-title {
+    display: none;
+}
+
+.callout[data-callout="glossary"] .callout-content {
+    color: var(--text-normal);
+    max-height: min(62vh, 680px);
+    overflow: auto;
+    overscroll-behavior: contain;
+    padding-right: 4px;
+    margin-top: 0;
+}
+
+.callout[data-callout="glossary"] .callout-content .internal-embed,
+.callout[data-callout="glossary"] .callout-content .markdown-embed {
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    padding: 0;
+    margin: 0;
+}
+
+.callout[data-callout="glossary"] .callout-content .markdown-embed-title {
+    display: none;
+}
+
+.callout[data-callout="glossary"] .callout-content .markdown-embed-content {
+    max-height: none;
+    padding-top: 0;
+}
+
 /* ============================================
    Glossary Sidebar View Styles
    ============================================ */
@@ -229,6 +275,16 @@ body.virtual-linker-hide-frontmatter .hover-popover .frontmatter-container {
     background: var(--background-modifier-hover);
 }
 
+.glossary-entry-draggable {
+    cursor: grab;
+}
+
+.glossary-entry-draggable:active,
+.glossary-entry-draggable.is-dragging {
+    cursor: grabbing;
+    opacity: 0.65;
+}
+
 .glossary-entry-item.is-excluded {
     opacity: 0.5;
 }
@@ -263,6 +319,13 @@ body.virtual-linker-hide-frontmatter .hover-popover .frontmatter-container {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+}
+
+.glossary-entry-exact-only {
+    font-size: 10px;
+    color: var(--text-accent);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
 }
 
 .glossary-entry-actions {

@@ -48,6 +48,57 @@ export class GlossaryLinker extends MarkdownRenderChild {
         return currentPath;
     }
 
+    private normalizeLinkLikePath(rawPath: string | null | undefined): string {
+        if (!rawPath) {
+            return '';
+        }
+
+        let value = rawPath.trim();
+        if (value.startsWith('![[') && value.endsWith(']]')) {
+            value = value.slice(3, -2);
+        }
+        if (value.startsWith('[[') && value.endsWith(']]')) {
+            value = value.slice(2, -2);
+        }
+
+        const pipeIndex = value.indexOf('|');
+        if (pipeIndex >= 0) {
+            value = value.slice(0, pipeIndex);
+        }
+
+        const hashIndex = value.indexOf('#');
+        if (hashIndex >= 0) {
+            value = value.slice(0, hashIndex);
+        }
+
+        return value.trim();
+    }
+
+    private resolveRenderSourceFile(): TFile | null {
+        const direct = this.app.vault.getFileByPath(this.ctx.sourcePath);
+        if (direct) {
+            return direct;
+        }
+
+        const embedEl = this.containerEl.closest('.markdown-embed, .internal-embed') as HTMLElement | null;
+        if (embedEl) {
+            const raw = embedEl.getAttribute('src') || embedEl.getAttribute('data-path') || embedEl.getAttribute('data-href');
+            const normalized = this.normalizeLinkLikePath(raw);
+            if (normalized) {
+                const resolved = this.app.metadataCache.getFirstLinkpathDest(getLinkpath(normalized), this.ctx.sourcePath);
+                if (resolved) {
+                    return resolved;
+                }
+                const directEmbedFile = this.app.vault.getFileByPath(normalized) || this.app.vault.getFileByPath(`${normalized}.md`);
+                if (directEmbedFile) {
+                    return directEmbedFile;
+                }
+            }
+        }
+
+        return this.app.workspace.getActiveFile();
+    }
+
     onload() {
         if (!this.settings.linkerActivated) {
             return;
@@ -64,11 +115,11 @@ export class GlossaryLinker extends MarkdownRenderChild {
         // Maybe there is a good and performant solution to this problem
         const linkedFiles = new Set<TFile>();
         const explicitlyLinkedFiles = new Set<TFile>();
+        const sourceFile = this.resolveRenderSourceFile();
 
         for (const tag of tags) {
             // console.log("Tag: ", tag);
             const nodeList = this.containerEl.getElementsByTagName(tag);
-            const children = this.containerEl.children;
             // if (nodeList.length === 0) continue;
             // if (nodeList.length != 0) console.log(tag, nodeList.length);
             for (let index = 0; index <= nodeList.length; index++) {
@@ -78,6 +129,15 @@ export class GlossaryLinker extends MarkdownRenderChild {
                     const childNode = item.childNodes[childNodeIndex];
 
                     if (childNode.nodeType === Node.TEXT_NODE) {
+                        const parentEl = childNode.parentElement;
+                        if (!parentEl) {
+                            continue;
+                        }
+                        // Do not mutate text already inside anchor elements (including math-link anchors).
+                        if (parentEl.closest('a')) {
+                            continue;
+                        }
+
                         let text = childNode.textContent || '';
                         if (text.length === 0) continue;
 
@@ -95,7 +155,10 @@ export class GlossaryLinker extends MarkdownRenderChild {
                             // If we are at a word boundary, get the current fitting files
                             const isWordBoundary = PrefixTree.checkWordBoundary(char); // , this.settings.wordBoundaryRegex
                             if (this.settings.matchAnyPartsOfWords || this.settings.matchBeginningOfWords || isWordBoundary) {
-                                const currentNodes = this.linkerCache.cache.getCurrentMatchNodes(i);
+                                const currentNodes = this.linkerCache.cache.getCurrentMatchNodes(
+                                    i,
+                                    this.settings.excludeLinksToOwnNote ? sourceFile : null
+                                );
                                 if (currentNodes.length > 0) {
                                     currentNodes.forEach((node) => {
                                         // Check if we want to include this note based on the settings
@@ -117,6 +180,18 @@ export class GlossaryLinker extends MarkdownRenderChild {
                                         // TODO: Handle multiple files
                                         // const file = node.files.values().next().value;
 
+                                        const filteredFiles = this.linkerCache.cache.filterFilesByMatchBoundaries(
+                                            node.files,
+                                            node.startsAtWordBoundary,
+                                            isWordBoundary
+                                        );
+                                        if (filteredFiles.length === 0) {
+                                            return;
+                                        }
+
+                                        const lowerFileBasenames = filteredFiles.map((file) => file.basename.toLowerCase());
+                                        const isAlias = !lowerFileBasenames.includes(name.toLowerCase());
+
                                         matches.push(
                                             new VirtualMatch(
                                                 this.app,
@@ -124,8 +199,8 @@ export class GlossaryLinker extends MarkdownRenderChild {
                                                 name,
                                                 nFrom,
                                                 nTo,
-                                                Array.from(node.files),
-                                                node.isAlias,
+                                                filteredFiles,
+                                                isAlias,
                                                 !isWordBoundary,
                                                 this.settings
                                             )
@@ -162,7 +237,7 @@ export class GlossaryLinker extends MarkdownRenderChild {
                             });
                         }
 
-                        const parent = childNode.parentElement;
+                        const parent = parentEl;
                         let lastTo = 0;
                         // console.log("Parent: ", parent);
 

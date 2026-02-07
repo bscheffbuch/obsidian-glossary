@@ -17,7 +17,7 @@ Features:
 - created links are **always up to date**
 - **no manual linking** necessary
 - works with **aliases** of notes
-- links do not appear in graph view & reference counting
+- virtual links are reflected in graph view, backlinks, and reference counts
 - updates the links automatically while you expand your vault or type new text
 - convert the virtual links to real links in the context menu
 
@@ -31,8 +31,7 @@ All occurrences of a note title or alias will be linked in your current note tex
 If you only want to include notes of a specific folder, you can define this folder in the settings.
 
 > [!Note]
-> The auto generated links are post-processed, so they neither change your note text to hard-coded links enclosed in brackets not
-> appear in the graph view or reference counting.
+> The auto generated links are post-processed, so they do not hard-code links in your note text. Virtual links are still reflected in graph view, backlinks, and reference counting.
 
 ## Installing the plugin
 

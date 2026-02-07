@@ -44,37 +44,38 @@ export class VirtualMatch {
         const link = document.createElement('a');
         link.href = href;
         link.textContent = linkText;
-        link.target = '_blank';
-        link.rel = 'noopener noreferrer';
+        link.target = '';
+        link.rel = '';
         link.setAttribute('from', this.from.toString());
         link.setAttribute('to', this.to.toString());
         link.setAttribute('origin-text', this.originText);
         link.classList.add('internal-link', 'virtual-link-a');
 
-        if (this.settings.openGlossaryLinksInSidebar && this.files.length > 0) {
-            link.addEventListener('click', (e) => {
-                e.preventDefault();
-                e.stopPropagation();
+        link.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
 
+            const targetFile = this.files.find((file) => file.path === href) ?? this.files[0];
+            if (!targetFile) {
+                return;
+            }
+
+            if (this.settings.openGlossaryLinksInSidebar) {
                 const leaves = this.app.workspace.getLeavesOfType('glossary-view');
                 if (leaves.length > 0) {
                     const view = leaves[0].view as any;
-                    // Find the file that matches the href or just use the first file stored in this match
-                    // Href is file path.
-                    // Note: href passed here might be just path.
-                    // Let's rely on this.files[0] for primary link.
-                    // If this is a multiple-reference link (generated later), we might need to handle it there too.
-
-                    // For main link:
-                    const targetFile = this.files.find(f => f.path === href) || this.files[0];
-
-                    if (view && view.openEntry && targetFile) {
+                    if (view && view.openEntry) {
                         view.openEntry(targetFile);
                         this.app.workspace.revealLeaf(leaves[0]);
+                        return;
                     }
                 }
-            });
-        }
+            }
+
+            const sourcePath = this.app.workspace.getActiveFile()?.path ?? '';
+            const openInNewLeaf = e.ctrlKey || e.metaKey;
+            this.app.workspace.openLinkText(targetFile.path, sourcePath, openInNewLeaf);
+        });
 
         return link;
     }

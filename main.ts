@@ -1,11 +1,12 @@
-import { App, EditorPosition, MarkdownView, Menu, Modal, Notice, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, TFolder, WorkspaceLeaf } from 'obsidian';
+import { App, EditorPosition, getLinkpath, MarkdownView, Menu, Modal, Notice, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, TFolder, WorkspaceLeaf } from 'obsidian';
 
 import { GlossaryLinker } from './linker/readModeLinker';
 import { liveLinkerPlugin } from './linker/liveLinker';
-import { ExternalUpdateManager, LinkerCache } from 'linker/linkerCache';
+import { ExternalUpdateManager, LinkerCache, PrefixTree } from 'linker/linkerCache';
 import { LinkerMetaInfoFetcher } from 'linker/linkerInfo';
 import { GlossaryView, GLOSSARY_VIEW_TYPE } from './linker/GlossaryView';
 import { AIEntryCreator } from './linker/aiEntryCreator';
+import { VirtualLinkMetadataBridge } from './linker/virtualLinkMetadata';
 
 import * as path from 'path';
 
@@ -36,6 +37,9 @@ export interface LinkerPluginSettings {
     propertyNameToMatchCase: string;
     propertyNameToIgnoreCase: string;
     propertyNameAntialiases: string;
+    propertyNameExactMatchOnly: string;
+    exactMatchPropertyBackfillDone: boolean;
+    antialiasPropertyBackfillDone: boolean;
     tagToExcludeFile: string;
     tagToIncludeFile: string;
     excludeLinksToOwnNote: boolean;
@@ -48,6 +52,11 @@ export interface LinkerPluginSettings {
     hideFrontmatterInHoverPreview: boolean;
     antialiasesEnabled: boolean;
     openGlossaryLinksInSidebar: boolean;
+    includeVirtualLinksInGraph: boolean;
+    includeVirtualLinksInBacklinks: boolean;
+    virtualLinkMetadataRefreshMs: number;
+    enableSidebarSwipeGesture: boolean;
+    debugLogging: boolean;
     // AI settings for glossary entry creation
     aiEnabled: boolean;
     aiActiveProvider: string;
@@ -145,6 +154,9 @@ const DEFAULT_SETTINGS: LinkerPluginSettings = {
     propertyNameToMatchCase: 'linker-match-case',
     propertyNameToIgnoreCase: 'linker-ignore-case',
     propertyNameAntialiases: 'antialiases',
+    propertyNameExactMatchOnly: 'linker-exact-match-only',
+    exactMatchPropertyBackfillDone: false,
+    antialiasPropertyBackfillDone: false,
     tagToExcludeFile: 'linker-exclude',
     tagToIncludeFile: 'linker-include',
     excludeLinksToOwnNote: true,
@@ -157,6 +169,11 @@ const DEFAULT_SETTINGS: LinkerPluginSettings = {
     hideFrontmatterInHoverPreview: true,
     antialiasesEnabled: true,
     openGlossaryLinksInSidebar: false,
+    includeVirtualLinksInGraph: true,
+    includeVirtualLinksInBacklinks: true,
+    virtualLinkMetadataRefreshMs: 6000,
+    enableSidebarSwipeGesture: true,
+    debugLogging: true,
     // AI settings
     aiEnabled: false,
     aiActiveProvider: 'openai',
@@ -176,6 +193,10 @@ Generate ONLY the definition content. Do NOT include frontmatter or YAML blocks.
 <Definition paragraph>
 
 <Optional bullet points for additional details>
+
+## Frontmatter Compatibility
+* If another instruction requests YAML frontmatter, include \`linker-exact-match-only: false\` by default.
+* Include \`antialiases: []\` in YAML frontmatter by default.
 
 ## Language Logic
 * **Variables:** \`<Allowed_Languages>\` = [{{ALLOWED_LANGUAGES}}], \`<Fallback_Language>\` = {{FALLBACK_LANGUAGE}}
@@ -219,11 +240,13 @@ Required fields:
 - title: Lemma form (singular, capitalized unless conventionally lowercase like pH, mRNA)
 - aliases: 2-5 common alternatives, plurals, synonyms, abbreviations (array of strings)
 - tags: Always include "glossary" plus 1-2 relevant topic tags (array of strings)
+- antialiases: Array of strings, default [] when no anti-aliases are needed.
+- exactMatchOnly: Boolean, default false. Set true only when strict exact title/alias matching is explicitly required.
 
 Language: Match the input term's language if in [{{ALLOWED_LANGUAGES}}], else use {{FALLBACK_LANGUAGE}}.
 
 Return ONLY valid JSON. No markdown code blocks. No explanation. Example:
-{"title": "Term", "aliases": ["alt1", "alt2"], "tags": ["glossary", "topic"]}`,
+{"title": "Term", "aliases": ["alt1", "alt2"], "tags": ["glossary", "topic"], "antialiases": [], "exactMatchOnly": false}`,
     aiAllowedLanguages: 'English, German',
     aiFallbackLanguage: 'English',
 
@@ -233,17 +256,38 @@ Return ONLY valid JSON. No markdown code blocks. No explanation. Example:
 export default class LinkerPlugin extends Plugin {
     settings: LinkerPluginSettings;
     updateManager = new ExternalUpdateManager();
+    private virtualLinkMetadata: VirtualLinkMetadataBridge | null = null;
+    private sidebarSwipeAccumulator = 0;
+    private sidebarSwipeDirection: -1 | 0 | 1 = 0;
+    private sidebarSwipeDirectionEventCount = 0;
+    private lastSidebarSwipeEventAt = 0;
+    private lastSidebarToggleDirection: -1 | 0 | 1 = 0;
+    private lastSidebarToggleAt = 0;
+    private exactMatchBackfillTimer: number | null = null;
+    private exactMatchBackfillRunning = false;
+    private lastMathDiagnosticsAtBySource = new Map<string, number>();
 
     async onload() {
         await this.loadSettings();
+        this.virtualLinkMetadata = new VirtualLinkMetadataBridge(this.app, this.settings);
+        this.logDebug('Plugin loading with settings', this.settings);
+        this.app.workspace.onLayoutReady(() => {
+            const detected = this.logMathLinkerStatus();
+            if (!detected) {
+                window.setTimeout(() => this.logMathLinkerStatus(), 1800);
+            }
+            void this.backfillExactMatchPropertyIfNeeded();
+        });
 
         // Apply body class for conditional CSS (hide frontmatter in hover preview)
         this.updateFrontmatterHidingClass();
+        this.registerDomEvent(document, 'wheel', (event) => this.handleGlobalSidebarSwipe(event), { passive: false, capture: true });
 
         // Set callback to update the cache when the settings are changed
         this.updateManager.registerCallback(() => {
             LinkerCache.getInstance(this.app, this.settings).clearCache();
             this.updateFrontmatterHidingClass();
+            this.virtualLinkMetadata?.scheduleRefresh('update-manager');
         });
 
         // Register the glossary sidebar view
@@ -257,11 +301,13 @@ export default class LinkerPlugin extends Plugin {
             this.activateGlossaryView();
         });
 
-        // Register antialiases as a known property type with icon
+        // Register glossary metadata properties as known property types
         // @ts-ignore - metadataTypeManager is internal API
         if (this.app.metadataTypeManager) {
             // @ts-ignore
             this.app.metadataTypeManager.setType(this.settings.propertyNameAntialiases, 'multitext');
+            // @ts-ignore
+            this.app.metadataTypeManager.setType(this.settings.propertyNameExactMatchOnly, 'checkbox');
             // Register a property info for rendering
             // @ts-ignore
             if (this.app.metadataTypeManager.properties) {
@@ -270,12 +316,54 @@ export default class LinkerPlugin extends Plugin {
                     name: this.settings.propertyNameAntialiases,
                     type: 'multitext'
                 };
+                // @ts-ignore
+                this.app.metadataTypeManager.properties[this.settings.propertyNameExactMatchOnly] = {
+                    name: this.settings.propertyNameExactMatchOnly,
+                    type: 'checkbox'
+                };
             }
         }
 
         // Register the glossary linker for the read mode
         this.registerMarkdownPostProcessor((element, context) => {
             context.addChild(new GlossaryLinker(this.app, this.settings, context, element));
+            this.enhanceMathContent(element, context.sourcePath);
+            this.bindMathLinkAnchors(element, context.sourcePath);
+            window.setTimeout(() => {
+                this.enhanceMathContent(element, context.sourcePath);
+                this.bindMathLinkAnchors(element, context.sourcePath);
+            }, 0);
+            window.setTimeout(() => this.bindMathLinkAnchors(element, context.sourcePath), 180);
+            window.setTimeout(() => this.bindMathLinkAnchors(element, context.sourcePath), 420);
+            if (this.settings.debugLogging) {
+                window.setTimeout(() => {
+                    const mathBlocks = element.querySelectorAll('.math, .math-block, .katex, mjx-container, .MathJax').length;
+                    if (mathBlocks === 0) {
+                        return;
+                    }
+                    const now = Date.now();
+                    const lastAt = this.lastMathDiagnosticsAtBySource.get(context.sourcePath) ?? 0;
+                    if (now - lastAt < 1800) {
+                        return;
+                    }
+                    this.lastMathDiagnosticsAtBySource.set(context.sourcePath, now);
+
+                    const mathLinks = element.querySelectorAll('.math-link, .math-link.internal-link').length;
+                    const virtualLinksInMath = element.querySelectorAll('.math .virtual-link-a, .math-block .virtual-link-a, .katex .virtual-link-a, mjx-container .virtual-link-a').length;
+                    const obsidianMathAnchors = element.querySelectorAll('.math a[href^="obsidian://"], .math-block a[href^="obsidian://"], .katex a[href^="obsidian://"], mjx-container a[href^="obsidian://"], .MathJax a[href^="obsidian://"]').length;
+                    const placeholderAnchors = element.querySelectorAll('a[href^="MathLinksID_"]').length;
+                    this.logDebug(`Read-mode math diagnostics for ${context.sourcePath}`, {
+                        mathBlocks,
+                        mathLinks,
+                        virtualLinksInMath,
+                        obsidianMathAnchors,
+                        placeholderAnchors,
+                    });
+                    if (mathLinks === 0 && virtualLinksInMath === 0 && obsidianMathAnchors === 0 && placeholderAnchors === 0) {
+                        this.logDebug(`No clickable math links found after render for ${context.sourcePath}`);
+                    }
+                }, 0);
+            }
         });
 
         // Register the live linker for the live edit mode
@@ -333,7 +421,7 @@ export default class LinkerPlugin extends Plugin {
             }
         }));
 
-        this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
+        this.registerEvent(this.app.vault.on('rename', (file) => {
             if (file instanceof TFile && file.extension === 'md') {
                 LinkerCache.getInstance(this.app, this.settings).clearCache();
                 this.updateManager.update();
@@ -342,9 +430,18 @@ export default class LinkerPlugin extends Plugin {
 
         this.registerEvent(this.app.metadataCache.on('changed', (file) => {
             // Triggered when file metadata (frontmatter/aliases) changes
+            if (this.exactMatchBackfillRunning) {
+                return;
+            }
             LinkerCache.getInstance(this.app, this.settings).clearCache();
             this.updateManager.update();
         }));
+
+        this.registerEvent(this.app.metadataCache.on('resolved', () => {
+            this.virtualLinkMetadata?.handleMetadataResolvedEvent();
+        }));
+
+        this.virtualLinkMetadata?.scheduleRefresh('startup');
 
         this.addCommand({
             id: 'open-glossary-view',
@@ -381,6 +478,14 @@ export default class LinkerPlugin extends Plugin {
                     return true;
                 }
                 return false;
+            },
+        });
+
+        this.addCommand({
+            id: 'debug-log-virtual-link-metadata-current-file',
+            name: 'Debug: Log virtual metadata for active file',
+            callback: () => {
+                this.logMetadataDiagnosticsForActiveFile();
             },
         });
 
@@ -528,6 +633,827 @@ export default class LinkerPlugin extends Plugin {
             }
         });
 
+    }
+
+    private logDebug(message: string, details?: unknown) {
+        if (!this.settings.debugLogging) {
+            return;
+        }
+        if (details === undefined) {
+            console.log(`[Glossary][Debug] ${message}`);
+        } else {
+            console.log(`[Glossary][Debug] ${message}`, details);
+        }
+    }
+
+    private logMathLinkerStatus(): boolean {
+        const appAny = this.app as any;
+        const plugins = appAny?.plugins?.plugins ?? {};
+        const pluginEntries = Object.entries<any>(plugins);
+        const exactIdMatch = plugins['math-links'] ?? plugins['Math-Links'] ?? plugins['MathLinks'];
+        const heuristicMatch = pluginEntries
+            .map(([, plugin]) => plugin)
+            .find((plugin) => {
+                const id = String(plugin?.manifest?.id ?? '').toLowerCase();
+                const name = String(plugin?.manifest?.name ?? '').toLowerCase();
+                return (id.includes('math') && id.includes('link')) || (name.includes('math') && name.includes('link'));
+            });
+        const mathLinks = exactIdMatch ?? heuristicMatch;
+
+        if (mathLinks) {
+            this.logDebug('Math Links plugin detected', {
+                id: mathLinks?.manifest?.id,
+                version: mathLinks?.manifest?.version,
+            });
+            return true;
+        } else {
+            this.logDebug('Math Links plugin not detected at layout-ready time', {
+                loadedPluginIds: pluginEntries.slice(0, 60).map(([id]) => id),
+                totalLoadedPlugins: pluginEntries.length,
+            });
+            return false;
+        }
+    }
+
+    private enhanceMathContent(root: HTMLElement, sourcePath: string): void {
+        const mathElements = root.querySelectorAll<HTMLElement>('.math, .math-block');
+        if (mathElements.length === 0) {
+            return;
+        }
+
+        let rewrittenCount = 0;
+        for (const mathElement of Array.from(mathElements)) {
+            const sourceMeta = this.getMathSourceMeta(mathElement);
+            if (!sourceMeta || !sourceMeta.source) {
+                continue;
+            }
+
+            const rewritten = this.rewriteMathSourceWithLinks(sourceMeta.source, sourcePath);
+            if (rewritten.count === 0 || rewritten.source === sourceMeta.source) {
+                continue;
+            }
+
+            sourceMeta.sourceHost.setAttribute(sourceMeta.sourceAttr, rewritten.source);
+            const rendered = this.renderMathElement(mathElement, rewritten.source, sourceMeta.displayMode);
+            if (rendered) {
+                rewrittenCount += rewritten.count;
+                this.logDebug(`Re-rendered math block with ${rewritten.count} glossary replacements`, {
+                    sourcePath,
+                    sourceAttr: sourceMeta.sourceAttr,
+                    wikiLinks: rewritten.wikiLinkCount,
+                    glossaryTerms: rewritten.termLinkCount,
+                });
+            } else {
+                this.logDebug('Math link rewrite prepared but no renderer was available', {
+                    sourcePath,
+                    sourceAttr: sourceMeta.sourceAttr,
+                });
+            }
+        }
+
+        if (rewrittenCount > 0) {
+            this.bindMathLinkAnchors(root, sourcePath);
+            this.logDebug(`Applied ${rewrittenCount} math glossary replacements in ${sourcePath}`);
+        }
+    }
+
+    private getMathSourceMeta(mathElement: HTMLElement): { source: string; sourceHost: HTMLElement; sourceAttr: 'data-math' | 'data-expression'; displayMode: boolean } | null {
+        const displayMode = mathElement.classList.contains('math-block');
+
+        if (mathElement.hasAttribute('data-math')) {
+            return {
+                source: mathElement.getAttribute('data-math') ?? '',
+                sourceHost: mathElement,
+                sourceAttr: 'data-math',
+                displayMode,
+            };
+        }
+        if (mathElement.hasAttribute('data-expression')) {
+            return {
+                source: mathElement.getAttribute('data-expression') ?? '',
+                sourceHost: mathElement,
+                sourceAttr: 'data-expression',
+                displayMode,
+            };
+        }
+
+        const parent = mathElement.parentElement as HTMLElement | null;
+        if (!parent) {
+            return null;
+        }
+        if (parent.hasAttribute('data-math')) {
+            return {
+                source: parent.getAttribute('data-math') ?? '',
+                sourceHost: parent,
+                sourceAttr: 'data-math',
+                displayMode,
+            };
+        }
+        if (parent.hasAttribute('data-expression')) {
+            return {
+                source: parent.getAttribute('data-expression') ?? '',
+                sourceHost: parent,
+                sourceAttr: 'data-expression',
+                displayMode,
+            };
+        }
+        return null;
+    }
+
+    private rewriteMathSourceWithLinks(source: string, sourcePath: string): { source: string; count: number; wikiLinkCount: number; termLinkCount: number } {
+        const wikiRewrite = this.rewriteWikiLinksInMathSource(source, sourcePath);
+        const termRewrite = this.rewriteGlossaryTermsInMathSource(wikiRewrite.source, sourcePath);
+        return {
+            source: termRewrite.source,
+            count: wikiRewrite.count + termRewrite.count,
+            wikiLinkCount: wikiRewrite.count,
+            termLinkCount: termRewrite.count,
+        };
+    }
+
+    private rewriteWikiLinksInMathSource(source: string, sourcePath: string): { source: string; count: number } {
+        let count = 0;
+        const wikiLinkPattern = /\[\[([^|\]]+)(?:\|([^\]]+))?\]\]/g;
+        const rewrittenSource = source.replace(wikiLinkPattern, (full, targetRaw: string, displayRaw: string | undefined) => {
+            const target = (targetRaw ?? '').trim();
+            const display = (displayRaw ?? targetRaw ?? '').trim();
+            if (!target || !display) {
+                return full;
+            }
+            const resolvedFile = this.app.metadataCache.getFirstLinkpathDest(getLinkpath(target), sourcePath);
+            const targetLinkText = resolvedFile
+                ? this.app.metadataCache.fileToLinktext(resolvedFile, sourcePath) || resolvedFile.path.replace(/\.md$/i, '')
+                : target;
+            const obsidianUrl = this.buildObsidianFileUrl(targetLinkText);
+            count += 1;
+            return `\\href{${obsidianUrl}}{\\text{${this.escapeLatexText(display)}}}`;
+        });
+        return { source: rewrittenSource, count };
+    }
+
+    private rewriteGlossaryTermsInMathSource(source: string, sourcePath: string): { source: string; count: number } {
+        const matches = this.collectGlossaryMathMatches(source, sourcePath);
+        if (matches.length === 0) {
+            return { source, count: 0 };
+        }
+
+        let rewrittenSource = source;
+        let rewrittenCount = 0;
+        const textRanges = this.findLatexCommandRanges(source, 'text');
+
+        for (const match of [...matches].sort((a, b) => b.from - a.from)) {
+            const linkText = this.app.metadataCache.fileToLinktext(match.target, sourcePath) || match.target.path.replace(/\.md$/i, '');
+            const obsidianUrl = this.buildObsidianFileUrl(linkText);
+            const escapedText = this.escapeLatexText(match.text);
+            const isInTextCommand = this.isRangeInsideAny(match.from, match.to, textRanges);
+            const replacement = isInTextCommand
+                ? `\\href{${obsidianUrl}}{${escapedText}}`
+                : `\\href{${obsidianUrl}}{\\text{${escapedText}}}`;
+
+            rewrittenSource =
+                rewrittenSource.slice(0, match.from) +
+                replacement +
+                rewrittenSource.slice(match.to);
+            rewrittenCount += 1;
+        }
+
+        return { source: rewrittenSource, count: rewrittenCount };
+    }
+
+    private collectGlossaryMathMatches(source: string, sourcePath: string): Array<{ from: number; to: number; text: string; target: TFile }> {
+        const linkerCache = LinkerCache.getInstance(this.app, this.settings);
+        linkerCache.reset();
+
+        const excludedRanges = this.collectMathExcludedRanges(source);
+        const sourceFile = this.resolveSourceFile(sourcePath);
+        const out: Array<{ from: number; to: number; text: string; target: TFile }> = [];
+
+        let i = 0;
+        while (i <= source.length) {
+            const codePoint = source.codePointAt(i);
+            const char = i < source.length && codePoint !== undefined ? String.fromCodePoint(codePoint) : '\n';
+            const isWordBoundary = PrefixTree.checkWordBoundary(char);
+
+            if (this.settings.matchAnyPartsOfWords || this.settings.matchBeginningOfWords || isWordBoundary) {
+                const currentNodes = linkerCache.cache.getCurrentMatchNodes(
+                    i,
+                    this.settings.excludeLinksToOwnNote ? sourceFile : null
+                );
+
+                currentNodes.forEach((node) => {
+                    if (
+                        !this.settings.matchAnyPartsOfWords &&
+                        this.settings.matchBeginningOfWords &&
+                        !node.startsAtWordBoundary &&
+                        this.settings.matchEndOfWords &&
+                        !isWordBoundary
+                    ) {
+                        return;
+                    }
+
+                    const nFrom = node.start;
+                    const nTo = node.end;
+                    if (nTo <= nFrom || nFrom < 0 || nTo > source.length) {
+                        return;
+                    }
+
+                    if (nFrom > 0 && source[nFrom - 1] === '\\') {
+                        return;
+                    }
+
+                    if (this.rangeIntersectsAny(nFrom, nTo, excludedRanges)) {
+                        return;
+                    }
+
+                    const filteredFiles = linkerCache.cache.filterFilesByMatchBoundaries(
+                        node.files,
+                        node.startsAtWordBoundary,
+                        isWordBoundary
+                    );
+                    if (filteredFiles.length === 0) {
+                        return;
+                    }
+
+                    const text = source.slice(nFrom, nTo);
+                    const target = filteredFiles[0];
+                    if (!target) {
+                        return;
+                    }
+
+                    out.push({ from: nFrom, to: nTo, text, target });
+                });
+            }
+
+            linkerCache.cache.pushChar(char);
+            i += char.length;
+        }
+
+        out.sort((a, b) => {
+            if (a.from === b.from) {
+                return (b.to - b.from) - (a.to - a.from);
+            }
+            return a.from - b.from;
+        });
+
+        const nonOverlapping: Array<{ from: number; to: number; text: string; target: TFile }> = [];
+        let lastEnd = -1;
+        for (const match of out) {
+            if (match.from < lastEnd) {
+                continue;
+            }
+            nonOverlapping.push(match);
+            lastEnd = match.to;
+        }
+
+        return nonOverlapping;
+    }
+
+    private resolveSourceFile(sourcePath: string): TFile | null {
+        if (!sourcePath) {
+            return this.app.workspace.getActiveFile() ?? null;
+        }
+        const direct = this.app.vault.getFileByPath(sourcePath);
+        if (direct) {
+            return direct;
+        }
+        const resolved = this.app.metadataCache.getFirstLinkpathDest(getLinkpath(sourcePath), '');
+        return resolved ?? this.app.workspace.getActiveFile() ?? null;
+    }
+
+    private collectMathExcludedRanges(source: string): Array<[number, number]> {
+        const ranges: Array<[number, number]> = [];
+        const patterns: RegExp[] = [
+            /\\href\{[^}]*\}\{[^}]*\}/g,
+            /obsidian:\/\/[^\s}]+/g,
+            /\[\[[^\]]+\]\]/g,
+        ];
+
+        patterns.forEach((pattern) => {
+            pattern.lastIndex = 0;
+            let match: RegExpExecArray | null;
+            while ((match = pattern.exec(source)) !== null) {
+                const start = match.index;
+                const end = start + match[0].length;
+                if (end > start) {
+                    ranges.push([start, end]);
+                }
+                if (match.index === pattern.lastIndex) {
+                    pattern.lastIndex += 1;
+                }
+            }
+        });
+
+        return ranges;
+    }
+
+    private findLatexCommandRanges(source: string, command: string): Array<[number, number]> {
+        const ranges: Array<[number, number]> = [];
+        const marker = `\\${command}{`;
+        let from = 0;
+
+        while (from < source.length) {
+            const start = source.indexOf(marker, from);
+            if (start === -1) {
+                break;
+            }
+            const braceStart = start + marker.length - 1;
+            let depth = 0;
+            let end = -1;
+
+            for (let i = braceStart; i < source.length; i++) {
+                const ch = source[i];
+                if (ch === '{') {
+                    depth += 1;
+                } else if (ch === '}') {
+                    depth -= 1;
+                    if (depth === 0) {
+                        end = i;
+                        break;
+                    }
+                }
+            }
+
+            if (end !== -1 && end > braceStart + 1) {
+                ranges.push([braceStart + 1, end]);
+                from = end + 1;
+            } else {
+                from = braceStart + 1;
+            }
+        }
+
+        return ranges;
+    }
+
+    private rangeIntersectsAny(from: number, to: number, ranges: Array<[number, number]>): boolean {
+        return ranges.some(([rangeFrom, rangeTo]) => from < rangeTo && to > rangeFrom);
+    }
+
+    private isRangeInsideAny(from: number, to: number, ranges: Array<[number, number]>): boolean {
+        return ranges.some(([rangeFrom, rangeTo]) => from >= rangeFrom && to <= rangeTo);
+    }
+
+    private renderMathElement(mathElement: HTMLElement, source: string, displayMode: boolean): boolean {
+        const katexRender = (window as any)?.katex?.render;
+        if (typeof katexRender !== 'function') {
+            const mathJax = (window as any)?.MathJax;
+            try {
+                mathElement.setAttribute('data-math', source);
+                mathElement.setAttribute('data-expression', source);
+                if (typeof mathJax?.typesetPromise === 'function') {
+                    void mathJax.typesetPromise([mathElement]);
+                    return true;
+                }
+                if (typeof mathJax?.typeset === 'function') {
+                    mathJax.typeset([mathElement]);
+                    return true;
+                }
+            } catch (error) {
+                this.logDebug('Failed to render rewritten math element with MathJax fallback', { error: String(error) });
+            }
+            return false;
+        }
+
+        try {
+            while (mathElement.firstChild) {
+                mathElement.removeChild(mathElement.firstChild);
+            }
+            katexRender(source, mathElement, {
+                displayMode,
+                throwOnError: false,
+                strict: false,
+                trust: (context: { command: string; url?: string; protocol?: string }) => {
+                    if (context.command !== '\\href') {
+                        return false;
+                    }
+                    const protocol = String(context.protocol ?? '');
+                    const url = String(context.url ?? '');
+                    return protocol === 'obsidian:' || url.startsWith('obsidian://');
+                },
+            });
+            return true;
+        } catch (error) {
+            this.logDebug('Failed to render rewritten math element', { error: String(error) });
+            return false;
+        }
+    }
+
+    private buildObsidianFileUrl(filePath: string): string {
+        const encodedVault = encodeURIComponent(this.app.vault.getName());
+        const encodedFile = encodeURIComponent(filePath);
+        return `obsidian://open?vault=${encodedVault}&file=${encodedFile}`;
+    }
+
+    private escapeLatexText(text: string): string {
+        return text
+            .replace(/\\/g, '\\textbackslash{}')
+            .replace(/([#$%&_{}])/g, '\\$1')
+            .replace(/\^/g, '\\textasciicircum{}')
+            .replace(/~/g, '\\textasciitilde{}');
+    }
+
+    private bindMathLinkAnchors(root: HTMLElement, sourcePath: string): void {
+        const mathAnchors = root.querySelectorAll<HTMLAnchorElement>(
+            'a.math-link, .math a[href^="obsidian://"], .math-block a[href^="obsidian://"], .katex a[href^="obsidian://"], mjx-container a[href^="obsidian://"], .MathJax a[href^="obsidian://"]'
+        );
+        if (mathAnchors.length === 0) {
+            return;
+        }
+
+        let boundCount = 0;
+        mathAnchors.forEach((anchor) => {
+            const anchorAny = anchor as any;
+            if (anchorAny.__glossaryMathLinkBound) {
+                return;
+            }
+
+            const href = anchor.getAttribute('href') ?? '';
+            const dataHref = anchor.getAttribute('data-href') ?? '';
+            const resolvedLinkText = dataHref || this.extractFileFromObsidianUrl(href) || href;
+            if (!resolvedLinkText || resolvedLinkText.startsWith('MathLinksID_')) {
+                return;
+            }
+
+            anchorAny.__glossaryMathLinkBound = true;
+            anchor.classList.add('internal-link');
+            anchor.classList.add('math-link');
+            anchor.setAttribute('data-href', resolvedLinkText);
+
+            anchor.addEventListener('click', (event: MouseEvent) => {
+                event.preventDefault();
+                event.stopPropagation();
+                const openInNewLeaf = event.ctrlKey || event.metaKey;
+                const openSourcePath = sourcePath || this.app.workspace.getActiveFile()?.path || '';
+                this.app.workspace.openLinkText(resolvedLinkText, openSourcePath, openInNewLeaf);
+            });
+
+            anchor.addEventListener('mouseover', (event: MouseEvent) => {
+                this.app.workspace.trigger('hover-link', {
+                    event,
+                    source: 'math-links',
+                    hoverParent: root,
+                    targetEl: anchor,
+                    linktext: resolvedLinkText,
+                    sourcePath: sourcePath || this.app.workspace.getActiveFile()?.path || '',
+                });
+            });
+
+            boundCount += 1;
+        });
+
+        if (boundCount > 0) {
+            this.logDebug(`Bound ${boundCount} math-link anchors for ${sourcePath}`);
+        }
+    }
+
+    private extractFileFromObsidianUrl(url: string): string | null {
+        if (!url || !url.startsWith('obsidian://')) {
+            return null;
+        }
+
+        try {
+            const parsed = new URL(url);
+            const file = parsed.searchParams.get('file');
+            return file || null;
+        } catch (error) {
+            this.logDebug('Failed to parse obsidian:// math link URL', { url, error: String(error) });
+            return null;
+        }
+    }
+
+    private handleGlobalSidebarSwipe(event: WheelEvent): void {
+        if (!this.settings.enableSidebarSwipeGesture) {
+            return;
+        }
+
+        const absX = Math.abs(event.deltaX);
+        const absY = Math.abs(event.deltaY);
+        const isHorizontalGesture = absX >= 8 && absX > absY * 1.1;
+        if (!isHorizontalGesture) {
+            if (Date.now() - this.lastSidebarSwipeEventAt > 180) {
+                this.resetSidebarSwipeGesture();
+            }
+            return;
+        }
+
+        const target = event.target instanceof HTMLElement ? event.target : null;
+        const scrollConsumer = this.findHorizontalScrollConsumer(target, event.deltaX);
+        if (scrollConsumer) {
+            this.resetSidebarSwipeGesture();
+            this.logDebug('Ignored horizontal swipe because a container can consume horizontal scrolling', {
+                x: event.clientX,
+                deltaX: event.deltaX,
+                deltaY: event.deltaY,
+                consumer: scrollConsumer.className,
+            });
+            return;
+        }
+
+        const now = Date.now();
+        if (now - this.lastSidebarSwipeEventAt > 180) {
+            this.resetSidebarSwipeGesture();
+        }
+        this.lastSidebarSwipeEventAt = now;
+
+        const direction: -1 | 1 = event.deltaX < 0 ? -1 : 1;
+        if (direction !== this.sidebarSwipeDirection) {
+            this.sidebarSwipeDirection = direction;
+            this.sidebarSwipeAccumulator = event.deltaX;
+            this.sidebarSwipeDirectionEventCount = 1;
+        } else {
+            this.sidebarSwipeAccumulator += event.deltaX;
+            this.sidebarSwipeDirectionEventCount += 1;
+        }
+
+        const swipeStepThreshold = 220;
+        if (Math.abs(this.sidebarSwipeAccumulator) < swipeStepThreshold || this.sidebarSwipeDirectionEventCount < 3) {
+            return;
+        }
+
+        const toggledSameDirectionRecently =
+            this.lastSidebarToggleDirection === direction &&
+            now - this.lastSidebarToggleAt < 700;
+        if (toggledSameDirectionRecently) {
+            this.sidebarSwipeAccumulator = direction * (swipeStepThreshold - 1);
+            return;
+        }
+
+        if (this.toggleRightSidebar()) {
+            this.lastSidebarToggleDirection = direction;
+            this.lastSidebarToggleAt = now;
+            this.sidebarSwipeAccumulator = 0;
+            this.logDebug('Toggled right sidebar via horizontal swipe step', {
+                x: event.clientX,
+                deltaX: event.deltaX,
+                deltaY: event.deltaY,
+                direction,
+            });
+            event.preventDefault();
+            event.stopPropagation();
+        }
+    }
+
+    private resetSidebarSwipeGesture(): void {
+        this.sidebarSwipeAccumulator = 0;
+        this.sidebarSwipeDirection = 0;
+        this.sidebarSwipeDirectionEventCount = 0;
+    }
+
+    private findHorizontalScrollConsumer(start: HTMLElement | null, deltaX: number): HTMLElement | null {
+        let node: HTMLElement | null = start;
+        while (node) {
+            if (this.canElementConsumeHorizontalScroll(node, deltaX)) {
+                return node;
+            }
+            node = node.parentElement;
+        }
+        return null;
+    }
+
+    private canElementConsumeHorizontalScroll(element: HTMLElement, deltaX: number): boolean {
+        const style = window.getComputedStyle(element);
+        const overflowX = style.overflowX;
+        const canScrollByStyle = overflowX === 'auto' || overflowX === 'scroll' || overflowX === 'overlay';
+        if (!canScrollByStyle) {
+            return false;
+        }
+
+        const maxScrollLeft = element.scrollWidth - element.clientWidth;
+        if (maxScrollLeft <= 1) {
+            return false;
+        }
+
+        const atStart = element.scrollLeft <= 0;
+        const atEnd = element.scrollLeft >= maxScrollLeft - 1;
+
+        if (deltaX > 0) {
+            return !atEnd;
+        }
+        if (deltaX < 0) {
+            return !atStart;
+        }
+        return false;
+    }
+
+    private isTruthyFrontmatterValue(value: unknown): boolean {
+        if (typeof value === 'boolean') {
+            return value;
+        }
+        if (typeof value === 'number') {
+            return value !== 0;
+        }
+        if (typeof value === 'string') {
+            const normalized = value.trim().toLowerCase();
+            return normalized === 'true' || normalized === 'yes' || normalized === '1' || normalized === 'on';
+        }
+        return false;
+    }
+
+    private hasFrontmatterProperty(frontmatter: Record<string, unknown> | undefined, propertyName: string): boolean {
+        if (!frontmatter || !propertyName) {
+            return false;
+        }
+        return Object.prototype.hasOwnProperty.call(frontmatter, propertyName);
+    }
+
+    private shouldBackfillExactMatchProperty(file: TFile, fetcher: LinkerMetaInfoFetcher): boolean {
+        const metaInfo = fetcher.getMetaInfo(file);
+        if (metaInfo.includeAllFiles) {
+            return !metaInfo.isInExcludedDir;
+        }
+        return metaInfo.includeFile || metaInfo.isInIncludedDir || metaInfo.excludeFile;
+    }
+
+    private scheduleExactMatchBackfill(delayMs = 700): void {
+        if (this.exactMatchBackfillTimer !== null) {
+            window.clearTimeout(this.exactMatchBackfillTimer);
+        }
+        this.exactMatchBackfillTimer = window.setTimeout(() => {
+            this.exactMatchBackfillTimer = null;
+            void this.backfillExactMatchPropertyIfNeeded();
+        }, delayMs);
+    }
+
+    private async backfillExactMatchPropertyIfNeeded(): Promise<void> {
+        if (
+            (this.settings.exactMatchPropertyBackfillDone && this.settings.antialiasPropertyBackfillDone) ||
+            this.exactMatchBackfillRunning
+        ) {
+            return;
+        }
+
+        const exactPropertyName = (this.settings.propertyNameExactMatchOnly ?? '').trim();
+        const antialiasPropertyName = (this.settings.propertyNameAntialiases ?? '').trim();
+        if (!exactPropertyName && !antialiasPropertyName) {
+            this.logDebug('Skipping glossary frontmatter backfill because both property names are empty');
+            return;
+        }
+
+        this.exactMatchBackfillRunning = true;
+        const fetcher = new LinkerMetaInfoFetcher(this.app, this.settings);
+        const files = this.app.vault.getMarkdownFiles();
+
+        let eligible = 0;
+        let touched = 0;
+        let skipped = 0;
+        let failed = 0;
+        let exactTouched = 0;
+        let antialiasTouched = 0;
+
+        this.logDebug('Starting glossary frontmatter backfill', {
+            exactPropertyName,
+            antialiasPropertyName,
+            totalFiles: files.length,
+        });
+
+        try {
+            for (const file of files) {
+                if (!this.shouldBackfillExactMatchProperty(file, fetcher)) {
+                    continue;
+                }
+                eligible += 1;
+
+                const frontmatter = this.app.metadataCache.getFileCache(file)?.frontmatter as Record<string, unknown> | undefined;
+                const missingExact = !!exactPropertyName && !this.hasFrontmatterProperty(frontmatter, exactPropertyName);
+                const missingAntialiases = !!antialiasPropertyName && !this.hasFrontmatterProperty(frontmatter, antialiasPropertyName);
+                if (!missingExact && !missingAntialiases) {
+                    skipped += 1;
+                    continue;
+                }
+
+                try {
+                    await this.app.fileManager.processFrontMatter(file, (mutableFrontmatter) => {
+                        if (missingExact && exactPropertyName && !Object.prototype.hasOwnProperty.call(mutableFrontmatter, exactPropertyName)) {
+                            mutableFrontmatter[exactPropertyName] = false;
+                            exactTouched += 1;
+                        }
+                        if (
+                            missingAntialiases &&
+                            antialiasPropertyName &&
+                            !Object.prototype.hasOwnProperty.call(mutableFrontmatter, antialiasPropertyName)
+                        ) {
+                            mutableFrontmatter[antialiasPropertyName] = [];
+                            antialiasTouched += 1;
+                        }
+                    });
+                    touched += 1;
+                } catch (error) {
+                    failed += 1;
+                    this.logDebug('Failed to write glossary frontmatter defaults for file', {
+                        path: file.path,
+                        error: String(error),
+                    });
+                }
+
+                if ((touched + skipped + failed) % 30 === 0) {
+                    await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+                }
+            }
+
+            this.settings.exactMatchPropertyBackfillDone = true;
+            this.settings.antialiasPropertyBackfillDone = true;
+            await this.saveData(this.settings);
+            this.logDebug('Completed glossary frontmatter backfill', {
+                exactPropertyName,
+                antialiasPropertyName,
+                eligible,
+                touched,
+                skipped,
+                failed,
+                exactTouched,
+                antialiasTouched,
+            });
+            if (touched > 0) {
+                new Notice(
+                    `Glossary: initialized frontmatter defaults in ${touched} entries` +
+                    (exactTouched > 0 ? ` (${exactPropertyName}: ${exactTouched})` : '') +
+                    (antialiasTouched > 0 ? ` (${antialiasPropertyName}: ${antialiasTouched})` : '')
+                );
+            }
+            this.updateManager.update();
+        } catch (error) {
+            console.error('[Glossary] Frontmatter backfill failed', error);
+        } finally {
+            this.exactMatchBackfillRunning = false;
+        }
+    }
+
+    private toggleRightSidebar(): boolean {
+        const appAny = this.app as any;
+        const commands = appAny.commands;
+        const commandIds = ['workspace:toggle-right-sidebar', 'app:toggle-right-sidebar'];
+
+        if (commands?.executeCommandById) {
+            for (const id of commandIds) {
+                if (commands.commands?.[id]) {
+                    commands.executeCommandById(id);
+                    return true;
+                }
+            }
+        }
+
+        const rightSplit = (this.app.workspace as any)?.rightSplit;
+        if (!rightSplit) {
+            return false;
+        }
+
+        if (typeof rightSplit.toggle === 'function') {
+            rightSplit.toggle();
+            return true;
+        }
+
+        const isCollapsed = typeof rightSplit.isCollapsed === 'function'
+            ? !!rightSplit.isCollapsed()
+            : !!rightSplit.collapsed;
+
+        if (isCollapsed && typeof rightSplit.expand === 'function') {
+            rightSplit.expand();
+            return true;
+        }
+
+        if (!isCollapsed && typeof rightSplit.collapse === 'function') {
+            rightSplit.collapse();
+            return true;
+        }
+
+        return false;
+    }
+
+    private logMetadataDiagnosticsForActiveFile(): void {
+        const file = this.app.workspace.getActiveFile();
+        if (!file) {
+            new Notice('No active file for diagnostics');
+            return;
+        }
+
+        const resolvedOut = this.app.metadataCache.resolvedLinks[file.path] ?? {};
+        let inboundCount = 0;
+        const inboundFrom: Record<string, number> = {};
+        for (const [sourcePath, targets] of Object.entries(this.app.metadataCache.resolvedLinks)) {
+            const count = targets[file.path];
+            if (typeof count === 'number' && count > 0) {
+                inboundFrom[sourcePath] = count;
+                inboundCount += count;
+            }
+        }
+
+        const metadataCacheAny = this.app.metadataCache as any;
+        const backlinksRaw = typeof metadataCacheAny.getBacklinksForFile === 'function'
+            ? metadataCacheAny.getBacklinksForFile(file)
+            : null;
+
+        this.logDebug(`Diagnostics for ${file.path}`, {
+            settings: {
+                includeVirtualLinksInGraph: this.settings.includeVirtualLinksInGraph,
+                includeVirtualLinksInBacklinks: this.settings.includeVirtualLinksInBacklinks,
+                virtualLinkMetadataRefreshMs: this.settings.virtualLinkMetadataRefreshMs,
+            },
+            resolvedOut,
+            inboundCount,
+            inboundFrom,
+            backlinksRaw,
+        });
+
+        new Notice('Glossary diagnostics logged to dev console');
     }
 
     private isPosWithinRange(
@@ -831,6 +1757,33 @@ export default class LinkerPlugin extends Plugin {
                 });
             }
 
+            const currentFrontmatter = app.metadataCache.getFileCache(file as TFile)?.frontmatter;
+            const exactProperty = settings.propertyNameExactMatchOnly;
+            const exactMatchOnlyEnabled = this.isTruthyFrontmatterValue(currentFrontmatter?.[exactProperty]);
+
+            menu.addItem((item) => {
+                item
+                    .setTitle(exactMatchOnlyEnabled ? '[Glossary] Disable exact matches only' : '[Glossary] Enable exact matches only')
+                    .setIcon(exactMatchOnlyEnabled ? 'list-x' : 'list-checks')
+                    .onClick(async () => {
+                        const targetFile = app.vault.getFileByPath(file.path);
+                        if (!targetFile) {
+                            console.error('No target file');
+                            return;
+                        }
+
+                        await app.fileManager.processFrontMatter(targetFile, (frontMatter) => {
+                            if (exactMatchOnlyEnabled) {
+                                delete frontMatter[exactProperty];
+                            } else {
+                                frontMatter[exactProperty] = true;
+                            }
+                        });
+
+                        updateManager.update();
+                    });
+            });
+
             // Capture the MouseEvent when the context menu is triggered
             document.addEventListener('contextmenu', contextMenuHandler, { once: true });
         } else {
@@ -891,7 +1844,16 @@ export default class LinkerPlugin extends Plugin {
         }
     }
 
-    onunload() { }
+    onunload() {
+        this.logDebug('Plugin unloading');
+        if (this.exactMatchBackfillTimer !== null) {
+            window.clearTimeout(this.exactMatchBackfillTimer);
+            this.exactMatchBackfillTimer = null;
+        }
+        this.virtualLinkMetadata?.destroy();
+        this.virtualLinkMetadata = null;
+        document.body.classList.remove('virtual-linker-hide-frontmatter');
+    }
 
     async loadSettings() {
         this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
@@ -908,9 +1870,33 @@ export default class LinkerPlugin extends Plugin {
 
     /** Update plugin settings. */
     async updateSettings(settings: Partial<LinkerPluginSettings> = <Partial<LinkerPluginSettings>>{}) {
+        const previousExactPropertyName = this.settings.propertyNameExactMatchOnly;
+        const previousAntialiasPropertyName = this.settings.propertyNameAntialiases;
+        this.logDebug('Updating settings', settings);
         Object.assign(this.settings, settings);
+
+        const exactPropertyChanged =
+            typeof settings.propertyNameExactMatchOnly === 'string' &&
+            settings.propertyNameExactMatchOnly !== previousExactPropertyName;
+        const antialiasPropertyChanged =
+            typeof settings.propertyNameAntialiases === 'string' &&
+            settings.propertyNameAntialiases !== previousAntialiasPropertyName;
+
+        if (exactPropertyChanged || antialiasPropertyChanged) {
+            if (exactPropertyChanged) {
+                this.settings.exactMatchPropertyBackfillDone = false;
+            }
+            if (antialiasPropertyChanged) {
+                this.settings.antialiasPropertyBackfillDone = false;
+            }
+        }
+
         await this.saveData(this.settings);
         this.updateManager.update();
+
+        if (exactPropertyChanged || antialiasPropertyChanged) {
+            this.scheduleExactMatchBackfill();
+        }
     }
 
     /** Toggle body class for hiding frontmatter in hover preview */
@@ -989,6 +1975,17 @@ class LinkerSettingTab extends PluginSettingTab {
                     })
                 );
         }
+
+        new Setting(containerEl)
+            .setName('Property name for exact-match-only entries')
+            .setDesc(
+                'If this frontmatter property is truthy on a glossary note, virtual links for that note are created only for exact full-word matches of title/aliases.'
+            )
+            .addText((text) =>
+                text.setValue(this.plugin.settings.propertyNameExactMatchOnly).onChange(async (value) => {
+                    await this.plugin.updateSettings({ propertyNameExactMatchOnly: value });
+                })
+            );
 
         if (this.plugin.settings.advancedSettings) {
             // Toggle to only link once
@@ -1359,6 +2356,60 @@ class LinkerSettingTab extends PluginSettingTab {
             .addToggle((toggle) =>
                 toggle.setValue(this.plugin.settings.openGlossaryLinksInSidebar).onChange(async (value) => {
                     await this.plugin.updateSettings({ openGlossaryLinksInSidebar: value });
+                })
+            );
+
+        new Setting(containerEl)
+            .setName('Swipe sideways to toggle right sidebar')
+            .setDesc('If enabled, horizontal touchpad swipes toggle the right sidebar with reversible step gestures (unless a horizontal scroller can consume the gesture).')
+            .addToggle((toggle) =>
+                toggle.setValue(this.plugin.settings.enableSidebarSwipeGesture).onChange(async (value) => {
+                    await this.plugin.updateSettings({ enableSidebarSwipeGesture: value });
+                })
+            );
+
+        new Setting(containerEl).setName('Metadata integration').setHeading();
+
+        new Setting(containerEl)
+            .setName('Show virtual links in Graph and reference counts')
+            .setDesc('Inject virtual links into metadata for Graph view and file reference count calculations.')
+            .addToggle((toggle) =>
+                toggle.setValue(this.plugin.settings.includeVirtualLinksInGraph).onChange(async (value) => {
+                    await this.plugin.updateSettings({ includeVirtualLinksInGraph: value });
+                })
+            );
+
+        new Setting(containerEl)
+            .setName('Show virtual links in Backlinks pane')
+            .setDesc('Inject synthetic virtual backlinks into the Backlinks pane for matched terms.')
+            .addToggle((toggle) =>
+                toggle.setValue(this.plugin.settings.includeVirtualLinksInBacklinks).onChange(async (value) => {
+                    await this.plugin.updateSettings({ includeVirtualLinksInBacklinks: value });
+                })
+            );
+
+        new Setting(containerEl)
+            .setName('Metadata refresh interval (ms)')
+            .setDesc('Higher values reduce lag spikes by refreshing graph/backlink metadata less frequently.')
+            .addText((text) =>
+                text
+                    .setValue(String(this.plugin.settings.virtualLinkMetadataRefreshMs))
+                    .onChange(async (value) => {
+                        const parsed = Number(value);
+                        if (!Number.isFinite(parsed)) {
+                            return;
+                        }
+                        const clamped = Math.max(500, Math.min(60000, Math.round(parsed)));
+                        await this.plugin.updateSettings({ virtualLinkMetadataRefreshMs: clamped });
+                    })
+            );
+
+        new Setting(containerEl)
+            .setName('Verbose debug logging')
+            .setDesc('Log detailed glossary integration internals (graph/backlinks/metadata/math/swipe) to the developer console.')
+            .addToggle((toggle) =>
+                toggle.setValue(this.plugin.settings.debugLogging).onChange(async (value) => {
+                    await this.plugin.updateSettings({ debugLogging: value });
                 })
             );
 

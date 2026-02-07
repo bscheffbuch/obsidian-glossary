@@ -68,6 +68,7 @@ export class PrefixTree {
     mapIndexedFilePathsToUpdateTime: Map<string, number> = new Map();
     mapFilePathToLeaveNodes: Map<string, PrefixNode[]> = new Map();
     mapFilePathToAntialiases: Map<string, Set<string>> = new Map();
+    mapFilePathToExactMatchOnly: Map<string, boolean> = new Map();
 
     constructor(public app: App, public settings: LinkerPluginSettings) {
         this.fetcher = new LinkerMetaInfoFetcher(this.app, this.settings);
@@ -81,6 +82,7 @@ export class PrefixTree {
         this.mapIndexedFilePathsToUpdateTime.clear();
         this.mapFilePathToLeaveNodes.clear();
         this.mapFilePathToAntialiases.clear();
+        this.mapFilePathToExactMatchOnly.clear();
     }
 
     getCurrentMatchNodes(index: number, excludedNote?: TFile | null): MatchNode[] {
@@ -174,6 +176,20 @@ export class PrefixTree {
         const upperCaseChars = value.split('').filter((char) => char === char.toUpperCase()).length;
 
         return upperCaseChars / length >= upperCasePart;
+    }
+
+    private static isTruthyFrontmatterValue(value: unknown): boolean {
+        if (typeof value === 'boolean') {
+            return value;
+        }
+        if (typeof value === 'number') {
+            return value !== 0;
+        }
+        if (typeof value === 'string') {
+            const normalized = value.trim().toLowerCase();
+            return normalized === 'true' || normalized === 'yes' || normalized === '1' || normalized === 'on';
+        }
+        return false;
     }
 
     private addFileToTree(file: TFile) {
@@ -274,6 +290,14 @@ export class PrefixTree {
             this.mapFilePathToAntialiases.delete(file.path);
         }
 
+        const exactMatchOnlyRaw = metadata?.frontmatter?.[this.settings.propertyNameExactMatchOnly];
+        const exactMatchOnly = PrefixTree.isTruthyFrontmatterValue(exactMatchOnlyRaw);
+        if (exactMatchOnly) {
+            this.mapFilePathToExactMatchOnly.set(file.path, true);
+        } else {
+            this.mapFilePathToExactMatchOnly.delete(file.path);
+        }
+
         let namesWithCaseIgnore = new Array<string>();
         let namesWithCaseMatch = new Array<string>();
 
@@ -347,6 +371,7 @@ export class PrefixTree {
         // Remove the file from the set of indexed files
         this.setIndexedFilePaths.delete(path);
         this.mapFilePathToLeaveNodes.delete(path);
+        this.mapFilePathToExactMatchOnly.delete(path);
 
         // Remove the update time of the file
         this.mapIndexedFilePathsToUpdateTime.delete(path);
@@ -496,6 +521,20 @@ export class PrefixTree {
         // }
         // console.log('Checking word boundary', char, pattern);
         return pattern.test(char);
+    }
+
+    filterFilesByMatchBoundaries(files: Iterable<TFile>, startsAtWordBoundary: boolean, endsAtWordBoundary: boolean): TFile[] {
+        const exactBoundaryMatch = startsAtWordBoundary && endsAtWordBoundary;
+        const out: TFile[] = [];
+
+        for (const file of files) {
+            if (this.mapFilePathToExactMatchOnly.get(file.path) && !exactBoundaryMatch) {
+                continue;
+            }
+            out.push(file);
+        }
+
+        return out;
     }
 
     static isFormattingChar(char: string): boolean {

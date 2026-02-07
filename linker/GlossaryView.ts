@@ -32,6 +32,7 @@ interface GlossaryEntry {
     name: string;
     aliases: string[];
     isExcluded: boolean;
+    exactMatchOnly: boolean;
 }
 
 interface GroupedEntries {
@@ -73,6 +74,20 @@ export class GlossaryView extends ItemView {
         private updateCallback: () => void
     ) {
         super(leaf);
+    }
+
+    private isTruthyFrontmatterValue(value: unknown): boolean {
+        if (typeof value === 'boolean') {
+            return value;
+        }
+        if (typeof value === 'number') {
+            return value !== 0;
+        }
+        if (typeof value === 'string') {
+            const normalized = value.trim().toLowerCase();
+            return normalized === 'true' || normalized === 'yes' || normalized === '1' || normalized === 'on';
+        }
+        return false;
     }
 
     getViewType(): string {
@@ -223,12 +238,16 @@ export class GlossaryView extends ItemView {
                     const cache = this.app.metadataCache.getFileCache(file);
                     const aliases = cache?.frontmatter?.aliases || [];
                     const normalizedAliases = Array.isArray(aliases) ? aliases : [aliases].filter(Boolean);
+                    const exactMatchOnly = this.isTruthyFrontmatterValue(
+                        cache?.frontmatter?.[this.settings.propertyNameExactMatchOnly]
+                    );
 
                     newEntries.push({
                         file,
                         name: file.basename,
                         aliases: normalizedAliases,
-                        isExcluded: metaInfo.excludeFile
+                        isExcluded: metaInfo.excludeFile,
+                        exactMatchOnly
                     });
                 }
             }
@@ -500,6 +519,24 @@ export class GlossaryView extends ItemView {
         const entryEl = container.createDiv({
             cls: `glossary-entry-item${entry.isExcluded ? ' is-excluded' : ''}`
         });
+        entryEl.setAttribute('draggable', 'true');
+        entryEl.addClass('glossary-entry-draggable');
+
+        entryEl.addEventListener('dragstart', (event) => {
+            if (!event.dataTransfer) return;
+            const callout = this.buildGlossaryCallout(entry);
+            const linkText = this.getLinkTextForActiveFile(entry.file);
+
+            event.dataTransfer.effectAllowed = 'copy';
+            event.dataTransfer.setData('text/plain', callout);
+            event.dataTransfer.setData('text/markdown', callout);
+            event.dataTransfer.setData('text/x-obsidian-link', `[[${linkText}]]`);
+            entryEl.addClass('is-dragging');
+        });
+
+        entryEl.addEventListener('dragend', () => {
+            entryEl.removeClass('is-dragging');
+        });
 
         const contentEl = entryEl.createDiv({ cls: 'glossary-entry-content' });
         const textEl = contentEl.createDiv({ cls: 'glossary-entry-text' });
@@ -510,6 +547,10 @@ export class GlossaryView extends ItemView {
             const a = entry.aliases;
             const aliasText = a.length > 3 ? `${a.slice(0, 3).join(', ')} +${a.length - 3}` : a.join(', ');
             textEl.createDiv({ cls: 'glossary-entry-aliases', text: aliasText });
+        }
+
+        if (entry.exactMatchOnly) {
+            textEl.createDiv({ cls: 'glossary-entry-exact-only', text: 'Exact matches only' });
         }
 
         contentEl.addEventListener('click', () => {
@@ -535,6 +576,17 @@ export class GlossaryView extends ItemView {
             e.stopPropagation();
             await this.toggleEntryExclusion(entry);
         });
+    }
+
+    private getLinkTextForActiveFile(file: TFile): string {
+        const sourcePath = this.app.workspace.getActiveFile()?.path ?? '';
+        const linkText = this.app.metadataCache.fileToLinktext(file, sourcePath);
+        return linkText || file.path.replace(/\.md$/i, '');
+    }
+
+    private buildGlossaryCallout(entry: GlossaryEntry): string {
+        const linkText = this.getLinkTextForActiveFile(entry.file);
+        return `> [!glossary]\n> ![[${linkText}]]\n`;
     }
 
     private navigateToEntry(entry: GlossaryEntry) {
@@ -630,6 +682,12 @@ export class GlossaryView extends ItemView {
         menu.addItem(i => i.setTitle('Open in new tab').setIcon('file-plus').onClick(() => this.app.workspace.getLeaf('tab').openFile(entry.file)));
         menu.addSeparator();
         menu.addItem(i => i.setTitle(entry.isExcluded ? 'Include' : 'Exclude').setIcon(entry.isExcluded ? 'plus' : 'trash').onClick(() => this.toggleEntryExclusion(entry)));
+        menu.addItem(i =>
+            i
+                .setTitle(entry.exactMatchOnly ? 'Disable exact matches only' : 'Enable exact matches only')
+                .setIcon(entry.exactMatchOnly ? 'list-x' : 'list-checks')
+                .onClick(() => this.toggleEntryExactMatchOnly(entry))
+        );
         menu.addSeparator();
         menu.addItem(i => i.setTitle('Reveal in explorer').setIcon('folder').onClick(() => {
             const fe = this.app.workspace.getLeavesOfType('file-explorer')[0];
@@ -654,9 +712,28 @@ export class GlossaryView extends ItemView {
         });
 
         entry.isExcluded = !entry.isExcluded;
+        sharedCacheValid = false;
         this.updateCallback();
         new Notice(entry.isExcluded ? 'Excluded' : 'Included');
         // Debounce list refresh
+        this.scheduleBackgroundRefresh();
+    }
+
+    private async toggleEntryExactMatchOnly(entry: GlossaryEntry): Promise<void> {
+        const propertyName = this.settings.propertyNameExactMatchOnly;
+
+        await this.app.fileManager.processFrontMatter(entry.file, (frontmatter) => {
+            if (entry.exactMatchOnly) {
+                delete frontmatter[propertyName];
+            } else {
+                frontmatter[propertyName] = true;
+            }
+        });
+
+        entry.exactMatchOnly = !entry.exactMatchOnly;
+        sharedCacheValid = false;
+        this.updateCallback();
+        new Notice(entry.exactMatchOnly ? 'Exact-match-only enabled' : 'Exact-match-only disabled');
         this.scheduleBackgroundRefresh();
     }
 }

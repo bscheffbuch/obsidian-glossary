@@ -158,7 +158,16 @@ class AutoLinkerPlugin implements PluginValue {
                             const nFrom = node.start;
                             const nTo = node.end;
                             const name = text.slice(nFrom, nTo);
-                            const isAlias = node.isAlias;
+                            const filteredFiles = this.linkerCache.cache.filterFilesByMatchBoundaries(
+                                node.files,
+                                node.startsAtWordBoundary,
+                                isWordBoundary
+                            );
+                            if (filteredFiles.length === 0) {
+                                continue;
+                            }
+                            const lowerFileBasenames = filteredFiles.map((file) => file.basename.toLowerCase());
+                            const isAlias = !lowerFileBasenames.includes(name.toLowerCase());
 
                             const aFrom = from + nFrom;
                             const aTo = from + nTo;
@@ -166,7 +175,7 @@ class AutoLinkerPlugin implements PluginValue {
                             // console.log("MATCH", name, aFrom, aTo, node.caseIsMatched, node.requiresCaseMatch)
 
                             matches.push(
-                                new VirtualMatch(this.app, id++, name, aFrom, aTo, Array.from(node.files), isAlias, !isWordBoundary, this.settings)
+                                new VirtualMatch(this.app, id++, name, aFrom, aTo, filteredFiles, isAlias, !isWordBoundary, this.settings)
                             );
                         }
                     }
