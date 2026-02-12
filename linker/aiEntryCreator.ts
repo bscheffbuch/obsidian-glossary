@@ -215,6 +215,43 @@ export class AIEntryCreator {
         return input.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     }
 
+    /**
+     * Properly quote a string for YAML frontmatter.
+     * Uses single quotes and doubles internal single quotes if the value
+     * contains backslashes, colons, or other YAML-special characters.
+     */
+    private yamlQuote(value: string): string {
+        // If the value contains backslashes, colons, quotes, or braces, use single-quoted scalar
+        if (/[\\:"'{}\[\]#|>&*!%@`]/.test(value)) {
+            // YAML single-quoted scalar: escape internal ' by doubling
+            return `'${value.replace(/'/g, "''")}'`;
+        }
+        return `"${value}"`;
+    }
+
+    /**
+     * Strip LaTeX commands to produce a plain-text version for use in filenames.
+     * E.g. \text{ATP}_\text{int} → ATP int
+     */
+    private stripLatexForFilename(text: string): string {
+        let out = text;
+        // Iteratively unwrap LaTeX commands: \text{ATP} → ATP
+        let prev = '';
+        while (prev !== out) {
+            prev = out;
+            out = out.replace(/\\[a-zA-Z]+\*?\{([^{}]*)\}/g, '$1');
+        }
+        // Remove remaining backslash commands without braces
+        out = out.replace(/\\[a-zA-Z]+\*?/g, '');
+        // Remove leftover braces
+        out = out.replace(/[{}]/g, '');
+        // Replace sub/superscript markers with spaces
+        out = out.replace(/[_^]/g, ' ');
+        // Clean up whitespace and dollar signs
+        out = out.replace(/\$/g, '').replace(/\s+/g, ' ').trim();
+        return out || text;
+    }
+
     getActiveProvider(): AIProviderConfig | null {
         const savedConfig = this.settings.aiProviders.find(p => p.id === this.settings.aiActiveProvider);
         if (savedConfig) return savedConfig;
@@ -662,7 +699,10 @@ Allowed languages: [${languages}]. Fallback: ${fallback}.`;
         // STEP 2: Determine final title (priority: metadata > extracted > term)
         // ============================================
         const title = metadata?.title || extractedTitle || term;
-        const sanitizedTitle = title.replace(/[\\/:*?"<>|]/g, '-').trim();
+        // If title contains LaTeX, use a stripped plain-text version for the filename
+        const hasLatex = /[\\{}]/.test(title);
+        const filenameTitle = hasLatex ? this.stripLatexForFilename(title) : title;
+        const sanitizedTitle = filenameTitle.replace(/[\\/:*?"<>|]/g, '-').trim() || 'untitled';
         const filePath = normalizePath(`${targetFolder}/${sanitizedTitle}.md`);
 
         // Check for existing file
@@ -695,6 +735,12 @@ Allowed languages: [${languages}]. Fallback: ${fallback}.`;
         // Prepare aliases from separate metadata
         const metadataAliases = (metadata?.aliases || []).filter(a => a && a !== title);
 
+        // If the filename was stripped of LaTeX, add the original LaTeX form as an alias
+        // so the math linker can find and match it
+        if (hasLatex && !metadataAliases.some(a => a === title)) {
+            metadataAliases.unshift(title);
+        }
+
         // Add original term as alias if it differs from the title (case-insensitive comparison)
         if (term.toLowerCase() !== title.toLowerCase() && !metadataAliases.some(a => a.toLowerCase() === term.toLowerCase())) {
             metadataAliases.unshift(term);
@@ -707,12 +753,12 @@ Allowed languages: [${languages}]. Fallback: ${fallback}.`;
             // Check if aliases already exist in extracted frontmatter to avoid duplicates or overwriting
             finalFrontmatter = extractedFrontmatter.trim();
             if (metadataAliases.length > 0 && !finalFrontmatter.includes('aliases:')) {
-                finalFrontmatter += `\naliases:\n${metadataAliases.map(a => `  - "${a}"`).join('\n')}`;
+                finalFrontmatter += `\naliases:\n${metadataAliases.map(a => `  - ${this.yamlQuote(a)}`).join('\n')}`;
             }
         } else {
             // No AI frontmatter, create default
             finalFrontmatter = metadataAliases.length > 0
-                ? `aliases:\n${metadataAliases.map(a => `  - "${a}"`).join('\n')}`
+                ? `aliases:\n${metadataAliases.map(a => `  - ${this.yamlQuote(a)}`).join('\n')}`
                 : `aliases: []`;
         }
 
@@ -728,18 +774,19 @@ Allowed languages: [${languages}]. Fallback: ${fallback}.`;
         if (!hasAntialiasProperty) {
             const antialiases = Array.isArray(metadata?.antialiases) ? metadata!.antialiases!.filter(Boolean) : [];
             if (antialiases.length > 0) {
-                finalFrontmatter += `\n${antialiasPropertyName}:\n${antialiases.map(a => `  - "${a}"`).join('\n')}`;
+                finalFrontmatter += `\n${antialiasPropertyName}:\n${antialiases.map(a => `  - ${this.yamlQuote(a)}`).join('\n')}`;
             } else {
                 finalFrontmatter += `\n${antialiasPropertyName}: []`;
             }
         }
 
         // Build final content - ensure no leading/trailing whitespace
+        const headingTitle = hasLatex ? `$` + title + `$` : title;
         const content = `---
 ${finalFrontmatter.trim()}
 ---
 
-# ${title}
+# ${headingTitle}
 
 ${cleanDefinition.trim()}
 `.trim() + '\n';

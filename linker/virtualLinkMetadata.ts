@@ -54,6 +54,8 @@ export class VirtualLinkMetadataBridge {
 
     private originalGetBacklinksForFile: ((file: any) => any) | null = null;
     private loggedBacklinksShape = false;
+    private lastLogMessage = '';
+    private lastLogAt = 0;
 
     constructor(
         private readonly app: App,
@@ -767,6 +769,12 @@ export class VirtualLinkMetadataBridge {
         if (!this.settings.debugLogging) {
             return;
         }
+        const now = Date.now();
+        if (message === this.lastLogMessage && now - this.lastLogAt < 1500) {
+            return;
+        }
+        this.lastLogMessage = message;
+        this.lastLogAt = now;
         console.log(`[Glossary][VirtualMetadata] ${message}`);
     }
 }

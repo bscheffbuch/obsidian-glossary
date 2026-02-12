@@ -127,6 +127,22 @@ export const AI_PROVIDER_PRESETS: Omit<AIProviderConfig, 'apiKey'>[] = [
     },
 ];
 
+type ExternalMathLinksApi = {
+    version?: string;
+    registerSourceRewriter?: (id: string, rewriter: (source: string, context: { sourcePath: string; renderer: string; displayMode?: boolean }) => string) => void;
+    unregisterSourceRewriter?: (id: string) => void;
+    createPlaceholder?: (target: string, prefix?: string) => string;
+    registerPlaceholder?: (id: string, target: string, url?: string) => void;
+    bindLinks?: (root: HTMLElement | Document) => void;
+    processContainer?: (root: HTMLElement, sourcePath?: string) => void;
+};
+
+declare global {
+    interface Window {
+        MathLinksAPI?: ExternalMathLinksApi;
+    }
+}
+
 const DEFAULT_SETTINGS: LinkerPluginSettings = {
     advancedSettings: false,
     linkerActivated: true,
@@ -266,11 +282,26 @@ export default class LinkerPlugin extends Plugin {
     private exactMatchBackfillTimer: number | null = null;
     private exactMatchBackfillRunning = false;
     private lastMathDiagnosticsAtBySource = new Map<string, number>();
+    private readonly glossaryMathPlaceholderPrefix = 'GlossaryMathID_';
+    private readonly glossaryMathLinkTargets = new Map<string, { linkText: string; url: string; createdAt: number }>();
+    private readonly mathLinksGlossaryRewriterId = 'glossary:virtual-linker';
+    private didAttachMathLinksApiRewriter = false;
+    private didLogMathLinksApiUnavailable = false;
+    private didLogKatexRendererUnavailable = false;
+    private didLogMathJaxRendererUnavailable = false;
 
     async onload() {
         await this.loadSettings();
         this.virtualLinkMetadata = new VirtualLinkMetadataBridge(this.app, this.settings);
         this.logDebug('Plugin loading with settings', this.settings);
+        // Try early patching before layout-ready in case KaTeX/MathLinksAPI are already available
+        this.tryAttachMathLinksApiRewriter('early-onload');
+        if (!this.didAttachMathLinksApiRewriter) {
+            this.ensureKatexRendererPatched('early-onload');
+            this.ensureMathJaxRenderersPatched('early-onload');
+        }
+        this.setupMathLinksApiIntegration();
+        this.patchMathRenderers();
         this.app.workspace.onLayoutReady(() => {
             const detected = this.logMathLinkerStatus();
             if (!detected) {
@@ -327,14 +358,44 @@ export default class LinkerPlugin extends Plugin {
         // Register the glossary linker for the read mode
         this.registerMarkdownPostProcessor((element, context) => {
             context.addChild(new GlossaryLinker(this.app, this.settings, context, element));
-            this.enhanceMathContent(element, context.sourcePath);
+            this.tryAttachMathLinksApiRewriter(`postprocess:${context.sourcePath}`);
+            const mathLinksApi = this.getMathLinksApi();
+            const usingMathLinksApi =
+                this.didAttachMathLinksApiRewriter &&
+                (typeof mathLinksApi?.processContainer === 'function' || typeof mathLinksApi?.bindLinks === 'function');
+
+            const runMathLinksApiProcess = () => {
+                if (!usingMathLinksApi || !mathLinksApi) {
+                    return;
+                }
+                if (typeof mathLinksApi.processContainer === 'function') {
+                    mathLinksApi.processContainer(element, context.sourcePath);
+                } else {
+                    mathLinksApi.bindLinks?.(element);
+                }
+            };
+
+            if (!usingMathLinksApi) {
+                this.enhanceMathContent(element, context.sourcePath);
+            } else {
+                runMathLinksApiProcess();
+            }
             this.bindMathLinkAnchors(element, context.sourcePath);
             window.setTimeout(() => {
-                this.enhanceMathContent(element, context.sourcePath);
+                if (!usingMathLinksApi) {
+                    this.enhanceMathContent(element, context.sourcePath);
+                }
                 this.bindMathLinkAnchors(element, context.sourcePath);
+                runMathLinksApiProcess();
             }, 0);
-            window.setTimeout(() => this.bindMathLinkAnchors(element, context.sourcePath), 180);
-            window.setTimeout(() => this.bindMathLinkAnchors(element, context.sourcePath), 420);
+            window.setTimeout(() => {
+                this.bindMathLinkAnchors(element, context.sourcePath);
+                runMathLinksApiProcess();
+            }, 180);
+            window.setTimeout(() => {
+                this.bindMathLinkAnchors(element, context.sourcePath);
+                runMathLinksApiProcess();
+            }, 420);
             if (this.settings.debugLogging) {
                 window.setTimeout(() => {
                     const mathBlocks = element.querySelectorAll('.math, .math-block, .katex, mjx-container, .MathJax').length;
@@ -351,13 +412,14 @@ export default class LinkerPlugin extends Plugin {
                     const mathLinks = element.querySelectorAll('.math-link, .math-link.internal-link').length;
                     const virtualLinksInMath = element.querySelectorAll('.math .virtual-link-a, .math-block .virtual-link-a, .katex .virtual-link-a, mjx-container .virtual-link-a').length;
                     const obsidianMathAnchors = element.querySelectorAll('.math a[href^="obsidian://"], .math-block a[href^="obsidian://"], .katex a[href^="obsidian://"], mjx-container a[href^="obsidian://"], .MathJax a[href^="obsidian://"]').length;
-                    const placeholderAnchors = element.querySelectorAll('a[href^="MathLinksID_"]').length;
+                    const placeholderAnchors = element.querySelectorAll('a[href^="MathLinksID_"], a[href^="GlossaryMathID_"], a[data-mjx-href^="MathLinksID_"], a[data-mjx-href^="GlossaryMathID_"]').length;
                     this.logDebug(`Read-mode math diagnostics for ${context.sourcePath}`, {
                         mathBlocks,
                         mathLinks,
                         virtualLinksInMath,
                         obsidianMathAnchors,
                         placeholderAnchors,
+                        usingMathLinksApi,
                     });
                     if (mathLinks === 0 && virtualLinksInMath === 0 && obsidianMathAnchors === 0 && placeholderAnchors === 0) {
                         this.logDebug(`No clickable math links found after render for ${context.sourcePath}`);
@@ -675,6 +737,326 @@ export default class LinkerPlugin extends Plugin {
         }
     }
 
+    private getMathLinksApi(): ExternalMathLinksApi | null {
+        const api = (window as Window).MathLinksAPI;
+        if (!api) {
+            return null;
+        }
+        return api;
+    }
+
+    private setupMathLinksApiIntegration(): void {
+        this.app.workspace.onLayoutReady(() => {
+            this.tryAttachMathLinksApiRewriter('layout-ready');
+            [220, 900, 2100].forEach((delay) => {
+                window.setTimeout(() => this.tryAttachMathLinksApiRewriter(`layout-retry-${delay}ms`), delay);
+            });
+            this.registerInterval(window.setInterval(() => this.tryAttachMathLinksApiRewriter('periodic-watchdog'), 2400));
+        });
+    }
+
+    private tryAttachMathLinksApiRewriter(reason: string): boolean {
+        if (this.didAttachMathLinksApiRewriter) {
+            return true;
+        }
+
+        const api = this.getMathLinksApi();
+        if (!api || typeof api.registerSourceRewriter !== 'function' || typeof api.createPlaceholder !== 'function') {
+            if (!this.didLogMathLinksApiUnavailable) {
+                this.didLogMathLinksApiUnavailable = true;
+                this.logDebug('MathLinksAPI unavailable; keeping local math rewrite fallback active');
+            }
+            return false;
+        }
+
+        this.didLogMathLinksApiUnavailable = false;
+        api.registerSourceRewriter(this.mathLinksGlossaryRewriterId, (source, context) => {
+            const sourcePath = String(context?.sourcePath ?? this.app.workspace.getActiveFile()?.path ?? '');
+            const rewritten = this.rewriteGlossaryTermsInMathSource(
+                String(source ?? ''),
+                sourcePath,
+                (linkText) => api.createPlaceholder?.(linkText, this.glossaryMathPlaceholderPrefix) ?? this.createGlossaryMathPlaceholder(linkText)
+            );
+            return rewritten.source;
+        });
+        this.didAttachMathLinksApiRewriter = true;
+        this.logDebug('Registered glossary math source rewriter with MathLinksAPI', {
+            reason,
+            mathLinksApiVersion: api.version ?? 'unknown',
+            rewriterId: this.mathLinksGlossaryRewriterId,
+        });
+        return true;
+    }
+
+    private patchMathRenderers(): void {
+        this.app.workspace.onLayoutReady(() => {
+            const runFallbackPatch = (reason: string) => {
+                if (this.didAttachMathLinksApiRewriter || this.tryAttachMathLinksApiRewriter(`fallback-check:${reason}`)) {
+                    return;
+                }
+                this.ensureKatexRendererPatched(reason);
+                this.ensureMathJaxRenderersPatched(reason);
+            };
+
+            // Try immediately at layout-ready before any rendering
+            runFallbackPatch('layout-ready-immediate');
+            window.setTimeout(() => runFallbackPatch('layout-delayed-50ms'), 50);
+            window.setTimeout(() => runFallbackPatch('layout-delayed-300ms'), 300);
+            [900, 2100].forEach((delay) => {
+                window.setTimeout(() => {
+                    runFallbackPatch(`layout-retry-${delay}ms`);
+                }, delay);
+            });
+            this.registerInterval(window.setInterval(() => {
+                runFallbackPatch('periodic-watchdog');
+            }, 2400));
+        });
+    }
+
+    private ensureKatexRendererPatched(reason: string): void {
+        if (this.didAttachMathLinksApiRewriter) {
+            return;
+        }
+        const katex = (window as any)?.katex;
+        if (!katex || typeof katex.render !== 'function') {
+            if (!this.didLogKatexRendererUnavailable) {
+                this.didLogKatexRendererUnavailable = true;
+                this.logDebug('KaTeX renderer unavailable for glossary math patch');
+            }
+            return;
+        }
+
+        this.didLogKatexRendererUnavailable = false;
+
+        type KatexRenderFunction = ((tex: string, element: HTMLElement, options?: any) => unknown) & {
+            __glossaryMathWrapped?: boolean;
+            __glossaryMathWrappedBy?: string;
+        };
+
+        const currentRender = katex.render as KatexRenderFunction;
+        if (currentRender.__glossaryMathWrapped && currentRender.__glossaryMathWrappedBy === 'virtual-linker') {
+            return;
+        }
+
+        const originalRender = currentRender.bind(katex);
+        const wrappedRender = ((tex: string, element: HTMLElement, options?: any) => {
+            const sourcePath = this.app.workspace.getActiveFile()?.path ?? '';
+            const rewritten = this.rewriteMathSourceWithLinks(tex, sourcePath);
+            const nextTex = rewritten.count > 0 ? rewritten.source : tex;
+
+            const newOptions = { ...(options ?? {}) };
+            const previousTrust = newOptions.trust;
+            newOptions.trust = (context: { command: string; protocol?: string; url?: string }) => {
+                if (context.command === '\\href') {
+                    const protocol = String(context.protocol ?? '');
+                    const url = String(context.url ?? '');
+                    if (
+                        protocol === 'obsidian:' ||
+                        url.startsWith('obsidian://') ||
+                        url.startsWith('MathLinksID_') ||
+                        url.startsWith(this.glossaryMathPlaceholderPrefix)
+                    ) {
+                        return true;
+                    }
+                }
+                if (typeof previousTrust === 'function') {
+                    return previousTrust(context);
+                }
+                return !!previousTrust;
+            };
+
+            const result = originalRender(nextTex, element, newOptions);
+            if (rewritten.count > 0) {
+                this.bindMathLinkAnchors(element, sourcePath);
+            }
+            return result;
+        }) as KatexRenderFunction;
+
+        wrappedRender.__glossaryMathWrapped = true;
+        wrappedRender.__glossaryMathWrappedBy = 'virtual-linker';
+        katex.render = wrappedRender;
+
+        this.logDebug('Patched KaTeX renderer for glossary math term linking', { reason });
+        this.scheduleActiveViewMathRefresh();
+    }
+
+    private scheduleActiveViewMathRefresh(): void {
+        window.setTimeout(() => {
+            const leaves = this.app.workspace.getLeavesOfType('markdown');
+            for (const leaf of leaves) {
+                const view = leaf.view;
+                if (view instanceof MarkdownView) {
+                    const contentEl = view.contentEl;
+                    const sourcePath = (view as any).file?.path ?? '';
+                    this.enhanceMathContent(contentEl, sourcePath);
+                    this.bindMathLinkAnchors(contentEl, sourcePath);
+                }
+            }
+        }, 80);
+    }
+
+    private ensureMathJaxRenderersPatched(reason: string): void {
+        if (this.didAttachMathLinksApiRewriter) {
+            return;
+        }
+        const mathJax = (window as any)?.MathJax;
+        const hasPatchableRenderer =
+            !!mathJax &&
+            (
+                typeof mathJax.tex2chtml === 'function' ||
+                typeof mathJax.tex2svg === 'function' ||
+                typeof mathJax.tex2chtmlPromise === 'function' ||
+                typeof mathJax.tex2svgPromise === 'function' ||
+                typeof mathJax.typeset === 'function' ||
+                typeof mathJax.typesetPromise === 'function'
+            );
+
+        if (!hasPatchableRenderer) {
+            if (!this.didLogMathJaxRendererUnavailable) {
+                this.didLogMathJaxRendererUnavailable = true;
+                this.logDebug('MathJax renderer unavailable for glossary math patch');
+            }
+            return;
+        }
+
+        this.didLogMathJaxRendererUnavailable = false;
+
+        type WrappedMathJaxFn = ((...args: any[]) => any) & {
+            __glossaryMathWrapped?: boolean;
+            __glossaryMathWrappedBy?: string;
+        };
+
+        const patchedFunctions: string[] = [];
+
+        const patchTexRenderer = (key: 'tex2chtml' | 'tex2svg' | 'tex2chtmlPromise' | 'tex2svgPromise') => {
+            const current = mathJax[key] as WrappedMathJaxFn | undefined;
+            if (typeof current !== 'function') {
+                return;
+            }
+            if (current.__glossaryMathWrapped && current.__glossaryMathWrappedBy === 'virtual-linker') {
+                return;
+            }
+
+            const original = current.bind(mathJax);
+            const wrapped = ((latex: string, options?: any) => {
+                const sourcePath = this.app.workspace.getActiveFile()?.path ?? '';
+                const rewritten = this.rewriteMathSourceWithLinks(String(latex ?? ''), sourcePath);
+                const nextLatex = rewritten.count > 0 ? rewritten.source : latex;
+                const result = original(nextLatex, options);
+
+                if (result && typeof result.then === 'function') {
+                    return result.then((node: unknown) => {
+                        if (node instanceof HTMLElement) {
+                            this.bindMathLinkAnchors(node, sourcePath);
+                        }
+                        return node;
+                    });
+                }
+
+                if (result instanceof HTMLElement) {
+                    this.bindMathLinkAnchors(result, sourcePath);
+                }
+                return result;
+            }) as WrappedMathJaxFn;
+
+            wrapped.__glossaryMathWrapped = true;
+            wrapped.__glossaryMathWrappedBy = 'virtual-linker';
+            mathJax[key] = wrapped;
+            patchedFunctions.push(key);
+        };
+
+        const patchTypesetRenderer = (key: 'typeset' | 'typesetPromise') => {
+            const current = mathJax[key] as WrappedMathJaxFn | undefined;
+            if (typeof current !== 'function') {
+                return;
+            }
+            if (current.__glossaryMathWrapped && current.__glossaryMathWrappedBy === 'virtual-linker') {
+                return;
+            }
+
+            const original = current.bind(mathJax);
+            const wrapped = ((elements?: HTMLElement[]) => {
+                const sourcePath = this.app.workspace.getActiveFile()?.path ?? '';
+                const targets = Array.isArray(elements) && elements.length > 0
+                    ? elements.filter((el) => el instanceof HTMLElement)
+                    : [];
+
+                let rewriteCount = 0;
+                targets.forEach((target) => {
+                    rewriteCount += this.rewriteMathSourcesInContainer(target, sourcePath);
+                });
+
+                if (rewriteCount > 0) {
+                    this.logDebug('Prepared MathJax source rewrites before typeset', {
+                        sourcePath,
+                        rewriteCount,
+                        renderer: key,
+                    });
+                }
+
+                const result = original(elements);
+                const bindTargets = targets.length > 0
+                    ? targets
+                    : (document.body instanceof HTMLElement ? [document.body] : []);
+
+                if (result && typeof result.then === 'function') {
+                    return result.then((value: unknown) => {
+                        bindTargets.forEach((target) => this.bindMathLinkAnchors(target, sourcePath));
+                        return value;
+                    });
+                }
+
+                bindTargets.forEach((target) => this.bindMathLinkAnchors(target, sourcePath));
+                return result;
+            }) as WrappedMathJaxFn;
+
+            wrapped.__glossaryMathWrapped = true;
+            wrapped.__glossaryMathWrappedBy = 'virtual-linker';
+            mathJax[key] = wrapped;
+            patchedFunctions.push(key);
+        };
+
+        patchTexRenderer('tex2chtml');
+        patchTexRenderer('tex2svg');
+        patchTexRenderer('tex2chtmlPromise');
+        patchTexRenderer('tex2svgPromise');
+        patchTypesetRenderer('typeset');
+        patchTypesetRenderer('typesetPromise');
+
+        if (patchedFunctions.length > 0) {
+            this.logDebug('Patched MathJax renderer(s) for glossary math term linking', {
+                reason,
+                functions: patchedFunctions,
+            });
+        }
+    }
+
+    private rewriteMathSourcesInContainer(root: HTMLElement, sourcePath: string): number {
+        const candidates = new Set<HTMLElement>();
+        if (root.matches('[data-math], [data-expression], .math, .math-block')) {
+            candidates.add(root);
+        }
+        root.querySelectorAll<HTMLElement>('[data-math], [data-expression], .math, .math-block').forEach((element) => {
+            candidates.add(element);
+        });
+
+        let rewrittenCount = 0;
+        candidates.forEach((candidate) => {
+            const sourceMeta = this.getMathSourceMeta(candidate);
+            if (!sourceMeta || !sourceMeta.source) {
+                return;
+            }
+            const rewritten = this.rewriteMathSourceWithLinks(sourceMeta.source, sourcePath);
+            if (rewritten.count === 0 || rewritten.source === sourceMeta.source) {
+                return;
+            }
+            sourceMeta.sourceHost.setAttribute(sourceMeta.sourceAttr, rewritten.source);
+            rewrittenCount += rewritten.count;
+        });
+
+        return rewrittenCount;
+    }
+
     private enhanceMathContent(root: HTMLElement, sourcePath: string): void {
         const mathElements = root.querySelectorAll<HTMLElement>('.math, .math-block');
         if (mathElements.length === 0) {
@@ -784,14 +1166,18 @@ export default class LinkerPlugin extends Plugin {
             const targetLinkText = resolvedFile
                 ? this.app.metadataCache.fileToLinktext(resolvedFile, sourcePath) || resolvedFile.path.replace(/\.md$/i, '')
                 : target;
-            const obsidianUrl = this.buildObsidianFileUrl(targetLinkText);
+            const placeholderId = this.createGlossaryMathPlaceholder(targetLinkText);
             count += 1;
-            return `\\href{${obsidianUrl}}{\\text{${this.escapeLatexText(display)}}}`;
+            return `\\href{${placeholderId}}{\\text{${this.escapeLatexText(display)}}}`;
         });
         return { source: rewrittenSource, count };
     }
 
-    private rewriteGlossaryTermsInMathSource(source: string, sourcePath: string): { source: string; count: number } {
+    private rewriteGlossaryTermsInMathSource(
+        source: string,
+        sourcePath: string,
+        createPlaceholder?: (linkText: string) => string
+    ): { source: string; count: number } {
         const matches = this.collectGlossaryMathMatches(source, sourcePath);
         if (matches.length === 0) {
             return { source, count: 0 };
@@ -803,12 +1189,12 @@ export default class LinkerPlugin extends Plugin {
 
         for (const match of [...matches].sort((a, b) => b.from - a.from)) {
             const linkText = this.app.metadataCache.fileToLinktext(match.target, sourcePath) || match.target.path.replace(/\.md$/i, '');
-            const obsidianUrl = this.buildObsidianFileUrl(linkText);
-            const escapedText = this.escapeLatexText(match.text);
+            const placeholderId = createPlaceholder ? createPlaceholder(linkText) : this.createGlossaryMathPlaceholder(linkText);
             const isInTextCommand = this.isRangeInsideAny(match.from, match.to, textRanges);
-            const replacement = isInTextCommand
-                ? `\\href{${obsidianUrl}}{${escapedText}}`
-                : `\\href{${obsidianUrl}}{\\text{${escapedText}}}`;
+            const hasLatexCommands = /\\[a-zA-Z]/.test(match.text);
+            const replacement = (isInTextCommand && !hasLatexCommands)
+                ? `\\href{${placeholderId}}{${this.escapeLatexText(match.text)}}`
+                : `\\href{${placeholderId}}{${match.text}}`;
 
             rewrittenSource =
                 rewrittenSource.slice(0, match.from) +
@@ -820,12 +1206,177 @@ export default class LinkerPlugin extends Plugin {
         return { source: rewrittenSource, count: rewrittenCount };
     }
 
+    private normalizeMathComparableText(value: string): string {
+        let out = String(value ?? '').normalize('NFKC');
+
+        let previous = '';
+        while (previous !== out) {
+            previous = out;
+            out = out.replace(/\\[a-zA-Z]+\*?\{([^{}]*)\}/g, '$1');
+        }
+
+        out = out
+            .replace(/\$+/g, ' ')
+            .replace(/\\[a-zA-Z]+\*?/g, ' ')
+            .replace(/[{}[\]()]/g, ' ')
+            .replace(/[^\p{L}\p{N}\s\-_]/gu, ' ')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLowerCase();
+
+        return out;
+    }
+
+    private getFileMatchNames(file: TFile): string[] {
+        const names = [file.basename];
+        if (!this.settings.includeAliases) {
+            return names;
+        }
+
+        const frontmatterAliases = this.app.metadataCache.getFileCache(file)?.frontmatter?.aliases;
+        const aliases = Array.isArray(frontmatterAliases)
+            ? frontmatterAliases
+            : frontmatterAliases != null
+                ? [frontmatterAliases]
+                : [];
+
+        aliases
+            .map((alias) => String(alias ?? '').trim())
+            .filter((alias) => alias.length > 0)
+            .forEach((alias) => names.push(alias));
+
+        return names;
+    }
+
+    private isLikelyMathStyledName(name: string): boolean {
+        return /[\\${}]/.test(name);
+    }
+
+    private buildMathContainmentCandidates(sourceFile: TFile | null): Array<{ file: TFile; variants: string[] }> {
+        const linkerCache = LinkerCache.getInstance(this.app, this.settings);
+        const out: Array<{ file: TFile; variants: string[] }> = [];
+
+        linkerCache.cache.setIndexedFilePaths.forEach((path) => {
+            const file = this.app.vault.getFileByPath(path);
+            if (!file) {
+                return;
+            }
+            if (this.settings.excludeLinksToOwnNote && sourceFile && file.path === sourceFile.path) {
+                return;
+            }
+
+            const variants = new Set<string>();
+            this.getFileMatchNames(file).forEach((name) => {
+                const normalized = this.normalizeMathComparableText(name);
+                if (normalized.length > 0) {
+                    variants.add(normalized);
+                }
+            });
+
+            if (variants.size > 0) {
+                out.push({
+                    file,
+                    variants: Array.from(variants),
+                });
+            }
+        });
+
+        return out;
+    }
+
+    private findContainmentFilesForMathText(
+        text: string,
+        candidates: Array<{ file: TFile; variants: string[] }>,
+        linkerCache: LinkerCache
+    ): TFile[] {
+        const normalizedText = this.normalizeMathComparableText(text);
+        if (!normalizedText) {
+            return [];
+        }
+
+        const out: TFile[] = [];
+        const requireExactOnlyPath = linkerCache.cache.mapFilePathToExactMatchOnly;
+
+        candidates.forEach((candidate) => {
+            const exactOnly = requireExactOnlyPath.get(candidate.file.path) === true;
+
+            for (const variant of candidate.variants) {
+                if (!variant) {
+                    continue;
+                }
+
+                const exactMatch = variant === normalizedText;
+                const allowContainment = variant.length >= 4 && normalizedText.length >= 4;
+                const containmentMatch = allowContainment && (variant.includes(normalizedText) || normalizedText.includes(variant));
+                const isMatch = exactMatch || containmentMatch;
+
+                if (!isMatch) {
+                    continue;
+                }
+                if (exactOnly && !exactMatch) {
+                    continue;
+                }
+
+                out.push(candidate.file);
+                return;
+            }
+        });
+
+        return out;
+    }
+
+    private choosePreferredMathTarget(files: TFile[], matchedText: string): TFile | null {
+        if (files.length === 0) {
+            return null;
+        }
+        if (files.length === 1) {
+            return files[0];
+        }
+
+        const normalizedText = this.normalizeMathComparableText(matchedText);
+        const uniqueFiles = Array.from(new Map(files.map((file) => [file.path, file])).values());
+
+        const scoreFile = (file: TFile): number => {
+            const normalizedBasename = this.normalizeMathComparableText(file.basename);
+            let score = 0;
+
+            if (file.basename.toLowerCase() === matchedText.toLowerCase()) {
+                score += 120;
+            }
+            if (normalizedBasename && normalizedBasename === normalizedText) {
+                score += 80;
+            }
+
+            const aliases = this.getFileMatchNames(file).slice(1);
+            if (aliases.some((alias) => alias.toLowerCase() === matchedText.toLowerCase())) {
+                score += 40;
+            }
+            if (!this.isLikelyMathStyledName(file.basename)) {
+                score += 10;
+            }
+
+            score -= Math.min(20, Math.floor(file.basename.length / 8));
+            return score;
+        };
+
+        uniqueFiles.sort((a, b) => {
+            const scoreDiff = scoreFile(b) - scoreFile(a);
+            if (scoreDiff !== 0) {
+                return scoreDiff;
+            }
+            return a.path.localeCompare(b.path);
+        });
+
+        return uniqueFiles[0] ?? null;
+    }
+
     private collectGlossaryMathMatches(source: string, sourcePath: string): Array<{ from: number; to: number; text: string; target: TFile }> {
         const linkerCache = LinkerCache.getInstance(this.app, this.settings);
         linkerCache.reset();
 
         const excludedRanges = this.collectMathExcludedRanges(source);
         const sourceFile = this.resolveSourceFile(sourcePath);
+        const containmentCandidates = this.buildMathContainmentCandidates(sourceFile);
         const out: Array<{ from: number; to: number; text: string; target: TFile }> = [];
 
         let i = 0;
@@ -870,12 +1421,12 @@ export default class LinkerPlugin extends Plugin {
                         node.startsAtWordBoundary,
                         isWordBoundary
                     );
-                    if (filteredFiles.length === 0) {
-                        return;
-                    }
-
                     const text = source.slice(nFrom, nTo);
-                    const target = filteredFiles[0];
+                    const containmentFiles = this.findContainmentFilesForMathText(text, containmentCandidates, linkerCache);
+                    const mergedCandidates = Array.from(
+                        new Map([...filteredFiles, ...containmentFiles].map((file) => [file.path, file])).values()
+                    );
+                    const target = this.choosePreferredMathTarget(mergedCandidates, text);
                     if (!target) {
                         return;
                     }
@@ -886,6 +1437,22 @@ export default class LinkerPlugin extends Plugin {
 
             linkerCache.cache.pushChar(char);
             i += char.length;
+        }
+
+        // Search for LaTeX-styled glossary names (containing \, {, }) literally in the math source.
+        // The PrefixTree splits on these characters so it can only match fragments;
+        // this pass finds the full LaTeX name as a single match.
+        const literalLatexMatches = this.collectLiteralLatexMathMatches(source, excludedRanges, sourceFile);
+        out.push(...literalLatexMatches);
+
+        if (out.length === 0) {
+            const fallbackMatches = this.collectContainmentFallbackMathMatches(
+                source,
+                excludedRanges,
+                containmentCandidates,
+                linkerCache
+            );
+            out.push(...fallbackMatches);
         }
 
         out.sort((a, b) => {
@@ -906,6 +1473,89 @@ export default class LinkerPlugin extends Plugin {
         }
 
         return nonOverlapping;
+    }
+
+    private collectLiteralLatexMathMatches(
+        source: string,
+        excludedRanges: Array<[number, number]>,
+        sourceFile: TFile | null
+    ): Array<{ from: number; to: number; text: string; target: TFile }> {
+        const linkerCache = LinkerCache.getInstance(this.app, this.settings);
+        const out: Array<{ from: number; to: number; text: string; target: TFile }> = [];
+
+        linkerCache.cache.setIndexedFilePaths.forEach((filePath) => {
+            const file = this.app.vault.getFileByPath(filePath);
+            if (!file) return;
+            if (this.settings.excludeLinksToOwnNote && sourceFile && file.path === sourceFile.path) return;
+
+            const names = this.getFileMatchNames(file);
+            for (const name of names) {
+                if (!this.isLikelyMathStyledName(name)) continue;
+                if (name.length < 3) continue;
+
+                // Search for this LaTeX-styled name literally in the math source
+                let searchFrom = 0;
+                while (searchFrom < source.length) {
+                    const idx = source.indexOf(name, searchFrom);
+                    if (idx === -1) break;
+
+                    const from = idx;
+                    const to = idx + name.length;
+
+                    if (!this.rangeIntersectsAny(from, to, excludedRanges)) {
+                        out.push({ from, to, text: name, target: file });
+                    }
+
+                    searchFrom = idx + 1;
+                }
+            }
+        });
+
+        return out;
+    }
+
+    private collectContainmentFallbackMathMatches(
+        source: string,
+        excludedRanges: Array<[number, number]>,
+        containmentCandidates: Array<{ file: TFile; variants: string[] }>,
+        linkerCache: LinkerCache
+    ): Array<{ from: number; to: number; text: string; target: TFile }> {
+        const out: Array<{ from: number; to: number; text: string; target: TFile }> = [];
+        const seen = new Set<string>();
+        const tokenPattern = /[\p{L}\p{N}][\p{L}\p{N}\-_]{1,}/gu;
+
+        let match: RegExpExecArray | null;
+        while ((match = tokenPattern.exec(source)) !== null) {
+            const text = match[0] ?? '';
+            const from = match.index;
+            const to = from + text.length;
+            if (!text || to <= from) {
+                continue;
+            }
+            if (this.rangeIntersectsAny(from, to, excludedRanges)) {
+                continue;
+            }
+
+            // Ignore LaTeX command names (e.g. \text, \frac).
+            if (from > 0 && source[from - 1] === '\\') {
+                continue;
+            }
+
+            const containmentFiles = this.findContainmentFilesForMathText(text, containmentCandidates, linkerCache);
+            const target = this.choosePreferredMathTarget(containmentFiles, text);
+            if (!target) {
+                continue;
+            }
+
+            const key = `${from}:${to}:${target.path}`;
+            if (seen.has(key)) {
+                continue;
+            }
+            seen.add(key);
+            out.push({ from, to, text, target });
+        }
+
+        return out;
     }
 
     private resolveSourceFile(sourcePath: string): TFile | null {
@@ -1027,7 +1677,12 @@ export default class LinkerPlugin extends Plugin {
                     }
                     const protocol = String(context.protocol ?? '');
                     const url = String(context.url ?? '');
-                    return protocol === 'obsidian:' || url.startsWith('obsidian://');
+                    return (
+                        protocol === 'obsidian:' ||
+                        url.startsWith('obsidian://') ||
+                        url.startsWith('MathLinksID_') ||
+                        url.startsWith(this.glossaryMathPlaceholderPrefix)
+                    );
                 },
             });
             return true;
@@ -1043,6 +1698,26 @@ export default class LinkerPlugin extends Plugin {
         return `obsidian://open?vault=${encodedVault}&file=${encodedFile}`;
     }
 
+    private createGlossaryMathPlaceholder(linkText: string): string {
+        const id = `${this.glossaryMathPlaceholderPrefix}${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+        this.glossaryMathLinkTargets.set(id, {
+            linkText,
+            url: this.buildObsidianFileUrl(linkText),
+            createdAt: Date.now(),
+        });
+
+        if (this.glossaryMathLinkTargets.size > 3000) {
+            const cutoff = Date.now() - 20 * 60 * 1000;
+            for (const [key, value] of this.glossaryMathLinkTargets) {
+                if (value.createdAt < cutoff) {
+                    this.glossaryMathLinkTargets.delete(key);
+                }
+            }
+        }
+
+        return id;
+    }
+
     private escapeLatexText(text: string): string {
         return text
             .replace(/\\/g, '\\textbackslash{}')
@@ -1053,7 +1728,7 @@ export default class LinkerPlugin extends Plugin {
 
     private bindMathLinkAnchors(root: HTMLElement, sourcePath: string): void {
         const mathAnchors = root.querySelectorAll<HTMLAnchorElement>(
-            'a.math-link, .math a[href^="obsidian://"], .math-block a[href^="obsidian://"], .katex a[href^="obsidian://"], mjx-container a[href^="obsidian://"], .MathJax a[href^="obsidian://"]'
+            `a.math-link, a[href^="${this.glossaryMathPlaceholderPrefix}"], a[data-mjx-href^="${this.glossaryMathPlaceholderPrefix}"], a[href^="MathLinksID_"], a[data-mjx-href^="MathLinksID_"], .math a[href^="obsidian://"], .math a[data-mjx-href^="obsidian://"], .math-block a[href^="obsidian://"], .math-block a[data-mjx-href^="obsidian://"], .katex a[href^="obsidian://"], mjx-container a[href^="obsidian://"], mjx-container a[data-mjx-href^="obsidian://"], .MathJax a[href^="obsidian://"], .MathJax a[data-mjx-href^="obsidian://"]`
         );
         if (mathAnchors.length === 0) {
             return;
@@ -1065,11 +1740,35 @@ export default class LinkerPlugin extends Plugin {
             if (anchorAny.__glossaryMathLinkBound) {
                 return;
             }
+            // Prevent double-binding if math-links plugin already bound this anchor
+            if (anchor.dataset.mathLinksBound === '1') {
+                return;
+            }
 
             const href = anchor.getAttribute('href') ?? '';
+            const dataMjxHref = anchor.getAttribute('data-mjx-href') ?? '';
             const dataHref = anchor.getAttribute('data-href') ?? '';
-            const resolvedLinkText = dataHref || this.extractFileFromObsidianUrl(href) || href;
-            if (!resolvedLinkText || resolvedLinkText.startsWith('MathLinksID_')) {
+            let resolvedLinkText = dataHref || this.extractFileFromObsidianUrl(href) || this.extractFileFromObsidianUrl(dataMjxHref) || '';
+            const placeholderId = href.startsWith(this.glossaryMathPlaceholderPrefix)
+                ? href
+                : (dataMjxHref.startsWith(this.glossaryMathPlaceholderPrefix) ? dataMjxHref : '');
+            if (!resolvedLinkText && placeholderId) {
+                const mapped = this.glossaryMathLinkTargets.get(placeholderId);
+                if (mapped) {
+                    resolvedLinkText = mapped.linkText;
+                    anchor.setAttribute('href', mapped.url);
+                    if (anchor.hasAttribute('data-mjx-href')) {
+                        anchor.setAttribute('data-mjx-href', mapped.url);
+                    }
+                    this.glossaryMathLinkTargets.delete(placeholderId);
+                }
+            }
+
+            if (
+                !resolvedLinkText ||
+                resolvedLinkText.startsWith('MathLinksID_') ||
+                resolvedLinkText.startsWith(this.glossaryMathPlaceholderPrefix)
+            ) {
                 return;
             }
 
@@ -1846,6 +2545,11 @@ export default class LinkerPlugin extends Plugin {
 
     onunload() {
         this.logDebug('Plugin unloading');
+        const mathLinksApi = this.getMathLinksApi();
+        if (this.didAttachMathLinksApiRewriter && typeof mathLinksApi?.unregisterSourceRewriter === 'function') {
+            mathLinksApi.unregisterSourceRewriter(this.mathLinksGlossaryRewriterId);
+            this.didAttachMathLinksApiRewriter = false;
+        }
         if (this.exactMatchBackfillTimer !== null) {
             window.clearTimeout(this.exactMatchBackfillTimer);
             this.exactMatchBackfillTimer = null;

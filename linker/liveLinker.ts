@@ -193,7 +193,7 @@ class AutoLinkerPlugin implements PluginValue {
             // We want to exclude some syntax nodes from being decorated,
             // such as code blocks and manually added links
             const excludedIntervalTree = new IntervalTree();
-            const excludedTypes = ['codeblock', 'code-block', 'inline-code', 'internal-link', 'link', 'url', 'hashtag'];
+            const excludedTypes = ['codeblock', 'code-block', 'inline-code', 'internal-link', 'link', 'url', 'hashtag', 'math'];
 
             // Track formatting nodes (bold, italic, strikethrough, highlight)
             const formattingIntervalTree = new IntervalTree<FormattingClass>();
