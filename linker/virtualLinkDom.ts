@@ -61,13 +61,21 @@ export class VirtualMatch {
             }
 
             if (this.settings.openGlossaryLinksInSidebar) {
-                const leaves = this.app.workspace.getLeavesOfType('glossary-view');
-                if (leaves.length > 0) {
-                    const view = leaves[0].view as any;
-                    if (view && view.openEntry) {
-                        view.openEntry(targetFile);
-                        this.app.workspace.revealLeaf(leaves[0]);
-                        return;
+                // Only open in glossary panel when the right sidebar is expanded
+                const rightSplit = (this.app.workspace as any)?.rightSplit;
+                const isCollapsed = rightSplit
+                    ? (typeof rightSplit.isCollapsed === 'function' ? rightSplit.isCollapsed() : rightSplit.collapsed)
+                    : true;
+
+                if (!isCollapsed) {
+                    const leaves = this.app.workspace.getLeavesOfType('glossary-view');
+                    if (leaves.length > 0) {
+                        const view = leaves[0].view as any;
+                        if (view && view.openEntry) {
+                            view.openEntry(targetFile);
+                            this.app.workspace.revealLeaf(leaves[0]);
+                            return;
+                        }
                     }
                 }
             }

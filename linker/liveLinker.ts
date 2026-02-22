@@ -1,5 +1,5 @@
 import { syntaxTree } from '@codemirror/language';
-import { RangeSetBuilder } from '@codemirror/state';
+import { RangeSetBuilder, StateEffect } from '@codemirror/state';
 import { Decoration, DecorationSet, EditorView, PluginSpec, PluginValue, ViewPlugin, ViewUpdate, WidgetType } from '@codemirror/view';
 import { App, MarkdownView, TFile, Vault } from 'obsidian';
 
@@ -7,6 +7,8 @@ import IntervalTree from '@flatten-js/interval-tree';
 import { LinkerPluginSettings } from 'main';
 import { ExternalUpdateManager, LinkerCache, PrefixTree } from './linkerCache';
 import { VirtualMatch, FormattingClass } from './virtualLinkDom';
+
+export const forceLiveLinkerRefreshEffect = StateEffect.define<null>();
 
 function isDescendant(parent: HTMLElement, child: HTMLElement, maxDepth: number = 10) {
     let node = child.parentNode;
@@ -63,6 +65,10 @@ class AutoLinkerPlugin implements PluginValue {
     }
 
     update(update: ViewUpdate, force: boolean = false) {
+        const forceRefreshFromEffect = update.transactions.some((transaction) =>
+            transaction.effects.some((effect) => effect.is(forceLiveLinkerRefreshEffect))
+        );
+
         const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
 
         // Check if the update is on the active view. We only need to check this, if one of the following settings is enabled
@@ -85,9 +91,9 @@ class AutoLinkerPlugin implements PluginValue {
         const activeFile = this.app.workspace.getActiveFile()?.path;
         const fileChanged = activeFile != this.lastActiveFile;
 
-        if (force || this.lastCursorPos != cursorPos || update.docChanged || fileChanged || update.viewportChanged) {
+        if (force || forceRefreshFromEffect || this.lastCursorPos != cursorPos || update.docChanged || fileChanged || update.viewportChanged) {
             this.lastCursorPos = cursorPos;
-            this.linkerCache.updateCache(force);
+            this.linkerCache.updateCache(force || forceRefreshFromEffect);
             this.decorations = this.buildDecorations(update.view, updateIsOnActiveView);
             this.lastActiveFile = activeFile ?? '';
         }

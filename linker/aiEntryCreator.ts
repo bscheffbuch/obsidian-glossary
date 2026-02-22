@@ -1,5 +1,44 @@
-import { App, Notice, TFile, normalizePath, requestUrl, MarkdownRenderer, Component } from 'obsidian';
-import { LinkerPluginSettings, AIProviderConfig, AI_PROVIDER_PRESETS } from '../main';
+import { App, Notice, TFile, normalizePath, MarkdownRenderer, Component } from 'obsidian';
+import { LinkerPluginSettings } from '../main';
+
+const HUB_PLUGIN_ID = 'ai-provider-hub';
+const DEFAULT_DEFINITION_MODEL_USE_ID = 'glossary.ai.definition';
+const DEFAULT_METADATA_MODEL_USE_ID = 'glossary.ai.metadata';
+
+interface HubModelSelection {
+    modelTypeId: string;
+    model: string;
+    modelKey?: string;
+    modelUseId?: string;
+}
+
+interface HubModelCatalogItem {
+    key: string;
+    modelTypeId: string;
+    modelTypeDisplayName: string;
+    model: string;
+}
+
+interface HubRequestOptions {
+    selection?: Partial<HubModelSelection>;
+}
+
+interface HubResponse<TData = unknown> {
+    data: TData;
+}
+
+interface AiProviderHubApi {
+    getModelSelectionForUse: (modelUseId: string) => HubModelCatalogItem | null;
+    chatCompletions: <TData = unknown>(
+        payload: Record<string, unknown>,
+        options?: HubRequestOptions
+    ) => Promise<HubResponse<TData>>;
+}
+
+interface AiProviderHubRuntime {
+    getApi?: () => AiProviderHubApi;
+    api?: AiProviderHubApi;
+}
 
 export interface AIGenerationResult {
     success: boolean;
@@ -7,10 +46,8 @@ export interface AIGenerationResult {
     error?: string;
 }
 
-export interface ModelListResult {
-    success: boolean;
-    models?: string[];
-    error?: string;
+interface CreateEntryFromSelectionOptions {
+    onDefinitionComplete?: () => void;
 }
 
 interface GlossaryMetadata {
@@ -252,49 +289,209 @@ export class AIEntryCreator {
         return out || text;
     }
 
-    getActiveProvider(): AIProviderConfig | null {
-        const savedConfig = this.settings.aiProviders.find(p => p.id === this.settings.aiActiveProvider);
-        if (savedConfig) return savedConfig;
-        const preset = AI_PROVIDER_PRESETS.find(p => p.id === this.settings.aiActiveProvider);
-        if (preset) return { ...preset, apiKey: '' };
-        return null;
+    private isRecord(value: unknown): value is Record<string, unknown> {
+        return typeof value === 'object' && value !== null && !Array.isArray(value);
     }
 
-    async fetchModels(): Promise<ModelListResult> {
-        const provider = this.getActiveProvider();
-        if (!provider) return { success: false, error: 'No provider configured' };
-        if (!provider.apiKey) return { success: false, error: 'API key not set' };
-        if (!provider.modelsEndpoint) return { success: false, error: 'Provider does not support model listing' };
-
-        try {
-            const headers: Record<string, string> = { 'Authorization': `Bearer ${provider.apiKey}` };
-            if (provider.id === 'anthropic') {
-                headers['x-api-key'] = provider.apiKey;
-                headers['anthropic-version'] = '2023-06-01';
-                delete headers['Authorization'];
-            }
-
-            const response = await requestUrl({ url: provider.modelsEndpoint, method: 'GET', headers });
-            const data = response.json;
-            let models: string[] = [];
-
-            if (data.data && Array.isArray(data.data)) {
-                models = data.data.map((m: any) => m.id || m.name).filter(Boolean);
-            } else if (data.models && Array.isArray(data.models)) {
-                models = data.models.map((m: any) => m.id || m.name || m).filter(Boolean);
-            }
-            models = models.sort();
-            return { success: true, models };
-        } catch (error) {
-            return { success: false, error: `Failed to fetch models: ${error instanceof Error ? error.message : String(error)}` };
+    private stringifyMessageContent(content: unknown): string {
+        if (typeof content === 'string') {
+            return content;
         }
+
+        if (Array.isArray(content)) {
+            return content
+                .map((item) => {
+                    if (typeof item === 'string') {
+                        return item;
+                    }
+                    if (this.isRecord(item) && typeof item.text === 'string') {
+                        return item.text;
+                    }
+                    return '';
+                })
+                .join('\n')
+                .trim();
+        }
+
+        if (this.isRecord(content) && typeof content.text === 'string') {
+            return content.text;
+        }
+
+        return '';
+    }
+
+    private extractTextFromResponse(data: unknown): string {
+        if (typeof data === 'string') {
+            return data;
+        }
+
+        if (!this.isRecord(data)) {
+            return '';
+        }
+
+        if (typeof data.output_text === 'string') {
+            return data.output_text;
+        }
+
+        const responseOutput = data.output;
+        if (Array.isArray(responseOutput)) {
+            const outputText = responseOutput
+                .map((outputItem) => {
+                    if (!this.isRecord(outputItem)) {
+                        return '';
+                    }
+
+                    if (typeof outputItem.text === 'string') {
+                        return outputItem.text;
+                    }
+
+                    const content = outputItem.content;
+                    if (Array.isArray(content)) {
+                        return content
+                            .map((contentItem) => {
+                                if (!this.isRecord(contentItem)) {
+                                    return '';
+                                }
+                                if (typeof contentItem.text === 'string') {
+                                    return contentItem.text;
+                                }
+                                return '';
+                            })
+                            .join('\n');
+                    }
+
+                    return '';
+                })
+                .join('\n')
+                .trim();
+
+            if (outputText) {
+                return outputText;
+            }
+        }
+
+        const choices = data.choices;
+        if (Array.isArray(choices) && choices.length > 0 && this.isRecord(choices[0])) {
+            const choice = choices[0];
+
+            if (typeof choice.text === 'string') {
+                return choice.text;
+            }
+
+            if (typeof choice.content === 'string') {
+                return choice.content;
+            }
+
+            if (this.isRecord(choice.message)) {
+                const messageText = this.stringifyMessageContent(choice.message.content);
+                if (messageText) {
+                    return messageText;
+                }
+            }
+
+            if (this.isRecord(choice.delta)) {
+                const deltaText = this.stringifyMessageContent(choice.delta.content);
+                if (deltaText) {
+                    return deltaText;
+                }
+            }
+        }
+
+        const content = data.content;
+        const contentText = this.stringifyMessageContent(content);
+        if (contentText) {
+            return contentText;
+        }
+
+        return '';
+    }
+
+    private getHubApi(notifyIfMissing = false): AiProviderHubApi | null {
+        const pluginManager = (this.app as App & {
+            plugins?: { getPlugin: (id: string) => unknown };
+        }).plugins;
+
+        const plugin = (pluginManager?.getPlugin(HUB_PLUGIN_ID) ?? null) as AiProviderHubRuntime | null;
+        if (!plugin) {
+            if (notifyIfMissing) {
+                new Notice('AI Provider Hub is not enabled. Enable the ai-provider-hub addon first.');
+            }
+            return null;
+        }
+
+        const api = plugin.getApi?.() ?? plugin.api;
+        if (!api && notifyIfMissing) {
+            new Notice('AI Provider Hub API is unavailable. Update or reload the ai-provider-hub addon.');
+        }
+        return api ?? null;
+    }
+
+    private getDefinitionModelUseId(): string {
+        return this.settings.aiDefinitionModelUseId?.trim() || DEFAULT_DEFINITION_MODEL_USE_ID;
+    }
+
+    private getMetadataModelUseId(): string {
+        return this.settings.aiMetadataModelUseId?.trim() || DEFAULT_METADATA_MODEL_USE_ID;
+    }
+
+    private parseModelKey(modelKey: string): { modelTypeId: string; model: string } | null {
+        const trimmed = modelKey.trim();
+        const separator = trimmed.indexOf('::');
+        if (separator <= 0) {
+            return null;
+        }
+        const modelTypeId = trimmed.slice(0, separator).trim();
+        const model = trimmed.slice(separator + 2).trim();
+        if (!modelTypeId || !model) {
+            return null;
+        }
+        return { modelTypeId, model };
+    }
+
+    private resolveMetadataSelection(api: AiProviderHubApi): Partial<HubModelSelection> {
+        const modelUseId = this.getMetadataModelUseId();
+        const definitionModelUseId = this.getDefinitionModelUseId();
+        const override = this.settings.aiMetadataModel?.trim();
+        const metadataSelection = api.getModelSelectionForUse(modelUseId);
+        const definitionSelection = api.getModelSelectionForUse(definitionModelUseId);
+
+        if (!override) {
+            if (metadataSelection) {
+                return { modelUseId };
+            }
+            return { modelUseId: definitionModelUseId };
+        }
+
+        const parsedOverride = this.parseModelKey(override);
+        if (parsedOverride) {
+            return {
+                modelTypeId: parsedOverride.modelTypeId,
+                model: parsedOverride.model,
+                modelKey: override,
+            };
+        }
+
+        if (metadataSelection) {
+            return {
+                modelTypeId: metadataSelection.modelTypeId,
+                model: override,
+            };
+        }
+
+        if (definitionSelection) {
+            return {
+                modelTypeId: definitionSelection.modelTypeId,
+                model: override,
+            };
+        }
+
+        return { modelUseId: definitionModelUseId };
     }
 
     async generateDefinitionStreaming(term: string, context: string): Promise<AIGenerationResult> {
         if (!this.settings.aiEnabled) return { success: false, error: 'AI generation is not enabled' };
-        const provider = this.getActiveProvider();
-        if (!provider) return { success: false, error: 'No AI provider configured' };
-        if (!provider.apiKey) return { success: false, error: 'API key is not configured' };
+        const api = this.getHubApi(true);
+        if (!api) return { success: false, error: 'AI Provider Hub is unavailable' };
 
         const languages = this.settings.aiAllowedLanguages || 'English';
         const fallback = this.settings.aiFallbackLanguage || 'English';
@@ -305,204 +502,72 @@ Context where the term appears:
 
 Language settings: Allowed languages are [${languages}]. If the term is not in one of these languages, use ${fallback}.`;
         const preview = new StreamingPreview(this.app);
-        let fullContent = '';
 
-        // Create status bar indicator
         const statusEl = document.body.querySelector('.status-bar')?.createDiv({ cls: 'status-bar-item ai-status' });
-        if (statusEl) {
-            statusEl.setText('AI starting...');
-        }
+        statusEl?.setText('AI generating...');
 
         try {
-            const headers: Record<string, string> = {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${provider.apiKey}`,
-            };
-
-            let body: any;
-            if (provider.id === 'anthropic') {
-                headers['x-api-key'] = provider.apiKey;
-                headers['anthropic-version'] = '2023-06-01';
-                delete headers['Authorization'];
-                body = {
-                    model: provider.model,
-                    max_tokens: 500,
-                    stream: true,
-                    system: this.getEffectiveSystemPrompt(),
-                    messages: [{ role: 'user', content: userPrompt }],
-                };
-            } else {
-                body = {
-                    model: provider.model,
+            const response = await api.chatCompletions<unknown>(
+                {
                     messages: [
                         { role: 'system', content: this.getEffectiveSystemPrompt() },
                         { role: 'user', content: userPrompt }
                     ],
                     temperature: 0.7,
                     max_tokens: this.settings.aiMaxTokens,
-                    stream: true,
-                };
-            }
-
-            // Longer timeout for models with extended thinking (2 minutes)
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 120000);
-
-            const response = await fetch(provider.endpoint, {
-                method: 'POST',
-                headers,
-                body: JSON.stringify(body),
-                signal: controller.signal,
-                keepalive: true,
-            });
-
-            clearTimeout(timeoutId);
-            if (!response.ok) {
-                const errorText = await response.text();
-                console.error('[AI Error Response]', errorText);
-                preview.updateContent(`Error: ${response.status} - ${errorText}`);
-                preview.finishGeneration(false);
-                return { success: false, error: `API error: ${response.status} - ${errorText}` };
-            }
-
-            const reader = response.body?.getReader();
-            if (!reader) {
-                console.error('[AI Error] No response body reader');
-                preview.finishGeneration(false);
-                return { success: false, error: 'No response stream' };
-            }
-
-            const decoder = new TextDecoder();
-            let lineBuffer = '';  // Buffer for incomplete lines
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-
-                const chunk = decoder.decode(value, { stream: true });
-                lineBuffer += chunk;
-
-                // Process complete lines (ending with \n)
-                const lines = lineBuffer.split('\n');
-                // Keep the last incomplete line in buffer
-                lineBuffer = lines.pop() || '';
-
-                for (const line of lines) {
-                    const trimmedLine = line.trim();
-                    if (!trimmedLine) continue;
-
-                    if (trimmedLine.startsWith('data: ')) {
-                        const data = trimmedLine.slice(6).trim();
-                        if (data === '[DONE]') continue;
-
-                        try {
-                            const json = JSON.parse(data);
-                            let contentChunk = '';
-
-                            if (provider.id === 'anthropic') {
-                                if (json.type === 'content_block_delta') {
-                                    contentChunk = json.delta?.text || '';
-                                }
-                            } else {
-                                // OpenAI-compatible: only use content, ignore reasoning
-                                const delta = json.choices?.[0]?.delta;
-                                contentChunk = delta?.content || '';
-
-                                // Update status bar based on what's being received
-                                if (delta?.reasoning && !contentChunk) {
-                                    statusEl?.setText('AI thinking...');
-                                } else if (contentChunk) {
-                                    statusEl?.setText('AI generating...');
-                                }
-                            }
-
-                            if (contentChunk) {
-                                fullContent += contentChunk;
-                                await preview.updateContent(fullContent);
-                            }
-                        } catch (e) {
-                            // Skip invalid JSON - might be truncated
-                            console.log('[AI Parse Error]', data.slice(0, 100));
-                        }
-                    } else if (trimmedLine.startsWith(':')) {
-                        // SSE comment (e.g., ": OPENROUTER PROCESSING"), skip
-                        statusEl?.setText('AI connecting...');
-                    }
+                },
+                {
+                    selection: {
+                        modelUseId: this.getDefinitionModelUseId(),
+                    },
                 }
-            }
+            );
 
-            statusEl?.remove();
-
-            if (!fullContent.trim()) {
+            const fullContent = this.extractTextFromResponse(response.data).trim();
+            if (!fullContent) {
                 preview.finishGeneration(false);
-                console.error('[AI Error] Stream completed but no content received');
-                return { success: false, error: 'Stream completed but no content received. Model may still be thinking - try a faster model.' };
+                return { success: false, error: 'No response from AI model.' };
             }
 
+            await preview.updateContent(fullContent);
             preview.finishGeneration(true);
-            return { success: true, definition: fullContent.trim() };
+            return { success: true, definition: fullContent };
         } catch (error) {
             console.error('[AI Error]', error);
-            statusEl?.remove();
             preview.finishGeneration(false);
             return { success: false, error: `Request failed: ${error instanceof Error ? error.message : String(error)}` };
+        } finally {
+            statusEl?.remove();
         }
     }
 
     async generateDefinition(term: string, context: string): Promise<AIGenerationResult> {
         if (!this.settings.aiEnabled) return { success: false, error: 'AI generation is not enabled' };
-        const provider = this.getActiveProvider();
-        if (!provider) return { success: false, error: 'No AI provider configured' };
-        if (!provider.apiKey) return { success: false, error: 'API key is not configured' };
+        const api = this.getHubApi(true);
+        if (!api) return { success: false, error: 'AI Provider Hub is unavailable' };
 
         const userPrompt = `Term: "${term}"\n\nContext where the term appears:\n"${context}"`;
 
         try {
-            const headers: Record<string, string> = {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${provider.apiKey}`,
-            };
-
-            let body: any;
-            if (provider.id === 'anthropic') {
-                headers['x-api-key'] = provider.apiKey;
-                headers['anthropic-version'] = '2023-06-01';
-                delete headers['Authorization'];
-                body = {
-                    model: provider.model,
-                    max_tokens: this.settings.aiMaxTokens,
-                    system: this.getEffectiveSystemPrompt(),
-                    messages: [{ role: 'user', content: userPrompt }],
-                };
-            } else {
-                body = {
-                    model: provider.model,
+            const response = await api.chatCompletions<unknown>(
+                {
                     messages: [
                         { role: 'system', content: this.getEffectiveSystemPrompt() },
                         { role: 'user', content: userPrompt }
                     ],
                     temperature: 0.7,
                     max_tokens: this.settings.aiMaxTokens,
-                };
-            }
+                },
+                {
+                    selection: {
+                        modelUseId: this.getDefinitionModelUseId(),
+                    },
+                }
+            );
 
-            const response = await requestUrl({ url: provider.endpoint, method: 'POST', headers, body: JSON.stringify(body) });
-            const data = response.json;
-
-            let definition: string | undefined;
-            if (provider.id === 'anthropic') {
-                definition = data.content?.[0]?.text?.trim();
-            } else {
-                // Try multiple extraction paths for different API formats
-                const choice = data.choices?.[0];
-                definition = choice?.message?.content?.trim()
-                    || choice?.text?.trim()
-                    || choice?.content?.trim();
-
-            }
-
+            const definition = this.extractTextFromResponse(response.data).trim();
             if (!definition) {
-                console.error('[AI Error] No definition. Full response:', JSON.stringify(data).slice(0, 1000));
-                return { success: false, error: `No response from AI. Check console for details.` };
+                return { success: false, error: 'No response from AI model.' };
             }
             return { success: true, definition };
         } catch (error) {
@@ -514,11 +579,9 @@ Language settings: Allowed languages are [${languages}]. If the term is not in o
     async generateMetadata(term: string, context: string): Promise<GlossaryMetadata | null> {
         if (!this.settings.aiEnabled || !this.settings.aiGenerateMetadata) return null;
 
-        const provider = this.getActiveProvider();
-        if (!provider || !provider.apiKey) return null;
+        const api = this.getHubApi(true);
+        if (!api) return null;
 
-        // Use metadata-specific model or fallback to main model
-        const model = this.settings.aiMetadataModel || provider.model;
         const systemPrompt = this.substitutePromptVariables(this.settings.aiMetadataSystemPrompt);
         const languages = this.settings.aiAllowedLanguages || 'English';
         const fallback = this.settings.aiFallbackLanguage || 'English';
@@ -530,54 +593,26 @@ Context:
 Allowed languages: [${languages}]. Fallback: ${fallback}.`;
 
         try {
-            const headers: Record<string, string> = {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${provider.apiKey}`,
-            };
-
-            let body: any;
-            if (provider.id === 'anthropic') {
-                headers['x-api-key'] = provider.apiKey;
-                headers['anthropic-version'] = '2023-06-01';
-                delete headers['Authorization'];
-                body = {
-                    model: model,
-                    max_tokens: 1000,
-                    system: systemPrompt,
-                    messages: [{ role: 'user', content: userPrompt }],
-                };
-            } else {
-                body = {
-                    model: model,
+            const response = await api.chatCompletions<unknown>(
+                {
                     messages: [
                         { role: 'system', content: systemPrompt },
                         { role: 'user', content: userPrompt }
                     ],
-                    temperature: 0.3, // Lower temperature for structured data
+                    temperature: 0.3,
                     max_tokens: 1000,
-                };
-            }
+                },
+                {
+                    selection: this.resolveMetadataSelection(api),
+                }
+            );
 
-            const response = await requestUrl({ url: provider.endpoint, method: 'POST', headers, body: JSON.stringify(body) });
-            const data = response.json;
-
-            let contentStr: string | undefined;
-
-            if (provider.id === 'anthropic') {
-                contentStr = data.content?.[0]?.text;
-            } else {
-                // Try multiple possible locations for content
-                contentStr = data.choices?.[0]?.message?.content
-                    || data.choices?.[0]?.text
-                    || data.choices?.[0]?.delta?.content;
-            }
-
+            const contentStr = this.extractTextFromResponse(response.data);
             if (!contentStr) {
                 console.error('[AI Metadata] No content in response');
                 return null;
             }
 
-            // Clean and extract JSON from response
             let jsonStr = contentStr.trim();
 
             // Remove markdown code blocks if present
@@ -801,7 +836,11 @@ ${cleanDefinition.trim()}
         }
     }
 
-    async createEntryFromSelection(term: string, context: string): Promise<TFile | null> {
+    async createEntryFromSelection(
+        term: string,
+        context: string,
+        options: CreateEntryFromSelectionOptions = {}
+    ): Promise<TFile | null> {
         new Notice(`Generating definition for "${term}"...`);
 
         // Run definition and metadata generation in parallel if enabled
@@ -812,13 +851,23 @@ ${cleanDefinition.trim()}
             metadataPromise = this.generateMetadata(term, context);
         }
 
-        const [definitionResult, metadataResult] = await Promise.all([definitionPromise, metadataPromise]);
+        let definitionResult: AIGenerationResult = { success: false, error: 'Definition generation failed' };
+        try {
+            definitionResult = await definitionPromise;
+        } finally {
+            try {
+                options.onDefinitionComplete?.();
+            } catch (error) {
+                console.error('[AI] onDefinitionComplete callback failed', error);
+            }
+        }
 
         if (!definitionResult.success || !definitionResult.definition) {
             new Notice(definitionResult.error || 'Failed to generate definition');
             return null;
         }
 
+        const metadataResult = await metadataPromise;
         const metadata = metadataResult || undefined;
         return this.createGlossaryEntry(term, definitionResult.definition, metadata);
     }

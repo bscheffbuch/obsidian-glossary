@@ -41,6 +41,43 @@ If your plugin does not need CSS, delete this file.
     background-color: var(--text-highlight-bg);
 }
 
+.virtual-linker-ai-selection-generating {
+    --virtual-linker-ai-base-color: var(--virtual-linker-glossary-link-color, var(--text-accent, var(--link-color, var(--interactive-accent))));
+    --virtual-linker-ai-shine-color: var(--text-on-accent, #ffffff);
+    color: var(--virtual-linker-ai-base-color);
+    background-image: linear-gradient(
+        112deg,
+        var(--virtual-linker-ai-base-color) 0%,
+        var(--virtual-linker-ai-base-color) 40%,
+        var(--virtual-linker-ai-shine-color) 50%,
+        var(--virtual-linker-ai-base-color) 60%,
+        var(--virtual-linker-ai-base-color) 100%
+    );
+    background-size: 240% 100%;
+    background-position: 180% 50%;
+    animation: virtual-linker-ai-selection-shine 1.7s linear infinite;
+    will-change: background-position;
+    backface-visibility: hidden;
+}
+
+@supports ((-webkit-background-clip: text) or (background-clip: text)) {
+    .virtual-linker-ai-selection-generating {
+        -webkit-background-clip: text;
+        background-clip: text;
+        -webkit-text-fill-color: transparent;
+        color: transparent;
+    }
+}
+
+@keyframes virtual-linker-ai-selection-shine {
+    0% {
+        background-position: 180% 50%;
+    }
+    100% {
+        background-position: -20% 50%;
+    }
+}
+
 .linker-suffix-icon {
     user-select: none;
 }
@@ -260,6 +297,19 @@ body.virtual-linker-hide-frontmatter .hover-popover .frontmatter-container {
 }
 
 
+
+/* Sidebar swipe gesture: proportional tracking */
+.glossary-swipe-active {
+    transition: none !important;
+    will-change: transform;
+    overflow: visible !important;
+}
+
+.glossary-swipe-snapping {
+    transition: transform 0.25s ease-out !important;
+    will-change: transform;
+    overflow: visible !important;
+}
 
 .glossary-entry-item {
     display: flex;

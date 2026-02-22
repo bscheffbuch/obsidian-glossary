@@ -1,7 +1,9 @@
-import { App, EditorPosition, getLinkpath, MarkdownView, Menu, Modal, Notice, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, TFolder, WorkspaceLeaf } from 'obsidian';
+import { App, Editor, EditorPosition, getLinkpath, MarkdownView, Menu, Modal, Notice, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, TFolder, WorkspaceLeaf } from 'obsidian';
+import { StateEffect, StateField } from '@codemirror/state';
+import { Decoration, DecorationSet, EditorView } from '@codemirror/view';
 
 import { GlossaryLinker } from './linker/readModeLinker';
-import { liveLinkerPlugin } from './linker/liveLinker';
+import { forceLiveLinkerRefreshEffect, liveLinkerPlugin } from './linker/liveLinker';
 import { ExternalUpdateManager, LinkerCache, PrefixTree } from 'linker/linkerCache';
 import { LinkerMetaInfoFetcher } from 'linker/linkerInfo';
 import { GlossaryView, GLOSSARY_VIEW_TYPE } from './linker/GlossaryView';
@@ -9,6 +11,63 @@ import { AIEntryCreator } from './linker/aiEntryCreator';
 import { VirtualLinkMetadataBridge } from './linker/virtualLinkMetadata';
 
 import * as path from 'path';
+
+const HUB_PLUGIN_ID = 'ai-provider-hub';
+
+const GLOSSARY_DEFINITION_MODEL_USE = {
+    id: 'glossary.ai.definition',
+    displayName: 'Glossary: Definition Generation',
+    description: 'Model variable used to generate glossary entry definitions.',
+};
+
+const GLOSSARY_METADATA_MODEL_USE = {
+    id: 'glossary.ai.metadata',
+    displayName: 'Glossary: Metadata Generation',
+    description: 'Model variable used to generate glossary entry metadata.',
+};
+
+interface HubModelSelection {
+    modelTypeId: string;
+    model: string;
+    modelKey?: string;
+    modelUseId?: string;
+}
+
+interface HubModelCatalogItem {
+    key: string;
+    modelTypeId: string;
+    modelTypeDisplayName: string;
+    model: string;
+}
+
+interface HubRequestOptions {
+    selection?: Partial<HubModelSelection>;
+}
+
+interface HubResponse<TData = unknown> {
+    data: TData;
+}
+
+interface AiProviderHubApi {
+    registerModelUse: (modelUse: {
+        id: string;
+        displayName: string;
+        description?: string;
+    }) => () => void;
+    getModelCatalog: (options?: { onlyConfigured?: boolean }) => HubModelCatalogItem[];
+    getModelSelectionForUse: (modelUseId: string) => HubModelCatalogItem | null;
+    setModelUseBinding?: (modelUseId: string, modelKey: string) => Promise<void>;
+    onRegistryChanged: (listener: () => void) => () => void;
+    chatCompletions: <TData = unknown>(
+        payload: Record<string, unknown>,
+        options?: HubRequestOptions
+    ) => Promise<HubResponse<TData>>;
+}
+
+interface AiProviderHubRuntime {
+    getApi?: () => AiProviderHubApi;
+    api?: AiProviderHubApi;
+}
 
 export interface LinkerPluginSettings {
     advancedSettings: boolean;
@@ -59,8 +118,8 @@ export interface LinkerPluginSettings {
     debugLogging: boolean;
     // AI settings for glossary entry creation
     aiEnabled: boolean;
-    aiActiveProvider: string;
-    aiProviders: AIProviderConfig[];
+    aiDefinitionModelUseId: string;
+    aiMetadataModelUseId: string;
     aiSystemPrompt: string;
     aiMaxTokens: number;
     // Metadata generation settings
@@ -73,59 +132,6 @@ export interface LinkerPluginSettings {
     // wordBoundaryRegex: string;
     // conversionFormat
 }
-
-export interface AIProviderConfig {
-    id: string;
-    name: string;
-    endpoint: string;
-    apiKey: string;
-    model: string;
-    modelsEndpoint?: string; // For fetching available models
-}
-
-// Default provider presets
-export const AI_PROVIDER_PRESETS: Omit<AIProviderConfig, 'apiKey'>[] = [
-    {
-        id: 'openai',
-        name: 'OpenAI',
-        endpoint: 'https://api.openai.com/v1/chat/completions',
-        model: 'gpt-4o-mini',
-        modelsEndpoint: 'https://api.openai.com/v1/models',
-    },
-    {
-        id: 'anthropic',
-        name: 'Anthropic',
-        endpoint: 'https://api.anthropic.com/v1/messages',
-        model: 'claude-3-haiku-20240307',
-    },
-    {
-        id: 'google',
-        name: 'Google Gemini',
-        endpoint: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',
-        model: 'gemini-2.0-flash',
-        modelsEndpoint: 'https://generativelanguage.googleapis.com/v1beta/openai/models',
-    },
-    {
-        id: 'openrouter',
-        name: 'OpenRouter',
-        endpoint: 'https://openrouter.ai/api/v1/chat/completions',
-        model: 'openai/gpt-4o-mini',
-        modelsEndpoint: 'https://openrouter.ai/api/v1/models',
-    },
-    {
-        id: 'ollama',
-        name: 'Ollama (Local)',
-        endpoint: 'http://localhost:11434/v1/chat/completions',
-        model: 'llama3.2',
-        modelsEndpoint: 'http://localhost:11434/v1/models',
-    },
-    {
-        id: 'custom',
-        name: 'Custom',
-        endpoint: '',
-        model: '',
-    },
-];
 
 type ExternalMathLinksApi = {
     version?: string;
@@ -142,6 +148,31 @@ declare global {
         MathLinksAPI?: ExternalMathLinksApi;
     }
 }
+
+const setAIGeneratingSelectionEffect = StateEffect.define<Array<{ from: number; to: number }>>();
+const clearAIGeneratingSelectionEffect = StateEffect.define<null>();
+const aiGeneratingSelectionDecoration = Decoration.mark({ class: 'virtual-linker-ai-selection-generating' });
+const aiGeneratingSelectionField = StateField.define<DecorationSet>({
+    create() {
+        return Decoration.none;
+    },
+    update(decorations, transaction) {
+        let next = decorations.map(transaction.changes);
+        for (const effect of transaction.effects) {
+            if (effect.is(setAIGeneratingSelectionEffect)) {
+                const ranges = effect.value
+                    .filter((range) => range.from < range.to)
+                    .map((range) => aiGeneratingSelectionDecoration.range(range.from, range.to));
+                next = ranges.length > 0 ? Decoration.set(ranges, true) : Decoration.none;
+            }
+            if (effect.is(clearAIGeneratingSelectionEffect)) {
+                next = Decoration.none;
+            }
+        }
+        return next;
+    },
+    provide: (field) => EditorView.decorations.from(field),
+});
 
 const DEFAULT_SETTINGS: LinkerPluginSettings = {
     advancedSettings: false,
@@ -192,8 +223,8 @@ const DEFAULT_SETTINGS: LinkerPluginSettings = {
     debugLogging: true,
     // AI settings
     aiEnabled: false,
-    aiActiveProvider: 'openai',
-    aiProviders: [],
+    aiDefinitionModelUseId: GLOSSARY_DEFINITION_MODEL_USE.id,
+    aiMetadataModelUseId: GLOSSARY_METADATA_MODEL_USE.id,
     aiSystemPrompt: `# Glossary Definition Generator
 
 Generate ONLY the definition content. Do NOT include frontmatter or YAML blocks.
@@ -272,13 +303,13 @@ Return ONLY valid JSON. No markdown code blocks. No explanation. Example:
 export default class LinkerPlugin extends Plugin {
     settings: LinkerPluginSettings;
     updateManager = new ExternalUpdateManager();
+    private readonly aiGeneratingSelectionRefCount = new WeakMap<EditorView, number>();
     private virtualLinkMetadata: VirtualLinkMetadataBridge | null = null;
-    private sidebarSwipeAccumulator = 0;
-    private sidebarSwipeDirection: -1 | 0 | 1 = 0;
-    private sidebarSwipeDirectionEventCount = 0;
+    private sidebarSwipeState: 'idle' | 'dragging' = 'idle';
+    private sidebarSwipeProgress = 0; // 0 = collapsed, 1 = expanded
+    private sidebarSwipeWasCollapsed = false;
+    private sidebarSwipeEndTimeout: ReturnType<typeof setTimeout> | null = null;
     private lastSidebarSwipeEventAt = 0;
-    private lastSidebarToggleDirection: -1 | 0 | 1 = 0;
-    private lastSidebarToggleAt = 0;
     private exactMatchBackfillTimer: number | null = null;
     private exactMatchBackfillRunning = false;
     private lastMathDiagnosticsAtBySource = new Map<string, number>();
@@ -289,9 +320,13 @@ export default class LinkerPlugin extends Plugin {
     private didLogMathLinksApiUnavailable = false;
     private didLogKatexRendererUnavailable = false;
     private didLogMathJaxRendererUnavailable = false;
+    private connectedHubApi: AiProviderHubApi | null = null;
+    private hubRegistryUnsubscribe: (() => void) | null = null;
+    private aiModelUseUnregisters: Array<() => void> = [];
 
     async onload() {
         await this.loadSettings();
+        this.connectHubIntegration();
         this.virtualLinkMetadata = new VirtualLinkMetadataBridge(this.app, this.settings);
         this.logDebug('Plugin loading with settings', this.settings);
         // Try early patching before layout-ready in case KaTeX/MathLinksAPI are already available
@@ -429,10 +464,12 @@ export default class LinkerPlugin extends Plugin {
         });
 
         // Register the live linker for the live edit mode
+        this.registerEditorExtension(aiGeneratingSelectionField);
         this.registerEditorExtension(liveLinkerPlugin(this.app, this.settings, this.updateManager));
 
         // This adds a settings tab so the user can configure various aspects of the plugin
         this.addSettingTab(new LinkerSettingTab(this.app, this));
+        this.registerEvent(this.app.workspace.on('layout-change', () => this.connectHubIntegration()));
 
         // Context menu item to convert virtual links to real links
         this.registerEvent(this.app.workspace.on('file-menu', (menu, file, source) => this.addContextMenuItem(menu, file, source)));
@@ -445,24 +482,7 @@ export default class LinkerPlugin extends Plugin {
                         .setTitle('Create Glossary Entry with AI')
                         .setIcon('sparkles')
                         .onClick(async () => {
-                            const selectedText = editor.getSelection().trim();
-                            if (!selectedText) return;
-
-                            // Get surrounding context
-                            const from = editor.getCursor('from');
-                            const to = editor.getCursor('to');
-                            const startLine = Math.max(0, from.line - 2);
-                            const endLine = Math.min(editor.lineCount() - 1, to.line + 2);
-                            let context = '';
-                            for (let i = startLine; i <= endLine; i++) {
-                                context += editor.getLine(i) + '\n';
-                            }
-
-                            const aiCreator = new AIEntryCreator(this.app, this.settings);
-                            const file = await aiCreator.createEntryFromSelection(selectedText, context);
-                            if (file) {
-                                this.updateManager.update();
-                            }
+                            await this.createGlossaryEntryFromSelection(editor);
                         });
                 });
             }
@@ -672,29 +692,201 @@ export default class LinkerPlugin extends Plugin {
                     return false;
                 }
                 if (checking) return true;
-
-                const selectedText = editor.getSelection().trim();
-                if (!selectedText) return;
-
-                // Get surrounding context (2 lines before and after selection)
-                const from = editor.getCursor('from');
-                const to = editor.getCursor('to');
-                const startLine = Math.max(0, from.line - 2);
-                const endLine = Math.min(editor.lineCount() - 1, to.line + 2);
-                let context = '';
-                for (let i = startLine; i <= endLine; i++) {
-                    context += editor.getLine(i) + '\n';
-                }
-
-                const aiCreator = new AIEntryCreator(this.app, this.settings);
-                aiCreator.createEntryFromSelection(selectedText, context).then(file => {
-                    if (file) {
-                        this.updateManager.update();
-                    }
-                });
+                void this.createGlossaryEntryFromSelection(editor);
             }
         });
 
+    }
+
+    private async createGlossaryEntryFromSelection(editor: Editor): Promise<void> {
+        const selectionData = this.getGlossaryGenerationSelection(editor);
+        if (!selectionData) {
+            return;
+        }
+
+        let createdFile: TFile | null = null;
+        let stopAnimation = this.startAIGeneratingSelectionAnimation(
+            editor,
+            selectionData.fromOffset,
+            selectionData.toOffset
+        );
+        const stopAnimationIfActive = () => {
+            if (!stopAnimation) {
+                return;
+            }
+            stopAnimation();
+            stopAnimation = null;
+        };
+
+        try {
+            const aiCreator = new AIEntryCreator(this.app, this.settings);
+            createdFile = await aiCreator.createEntryFromSelection(
+                selectionData.selectedText,
+                selectionData.context,
+                {
+                    onDefinitionComplete: stopAnimationIfActive,
+                }
+            );
+            if (createdFile) {
+                this.updateManager.update();
+            }
+        } finally {
+            stopAnimationIfActive();
+            if (createdFile) {
+                this.forceLiveLinkerRefresh(editor);
+            }
+        }
+    }
+
+    private getGlossaryGenerationSelection(editor: Editor): { selectedText: string; context: string; fromOffset: number; toOffset: number } | null {
+        const selectedText = editor.getSelection().trim();
+        if (!selectedText) {
+            return null;
+        }
+
+        const from = editor.getCursor('from');
+        const to = editor.getCursor('to');
+        const fromOffset = editor.posToOffset(from);
+        const toOffset = editor.posToOffset(to);
+        const normalizedFrom = Math.min(fromOffset, toOffset);
+        const normalizedTo = Math.max(fromOffset, toOffset);
+        if (normalizedFrom === normalizedTo) {
+            return null;
+        }
+
+        const startLine = Math.max(0, from.line - 2);
+        const endLine = Math.min(editor.lineCount() - 1, to.line + 2);
+        let context = '';
+        for (let i = startLine; i <= endLine; i++) {
+            context += editor.getLine(i) + '\n';
+        }
+
+        return {
+            selectedText,
+            context,
+            fromOffset: normalizedFrom,
+            toOffset: normalizedTo,
+        };
+    }
+
+    private startAIGeneratingSelectionAnimation(editor: Editor, from: number, to: number): (() => void) | null {
+        if (from >= to) {
+            return null;
+        }
+
+        const editorView = this.getCodeMirrorEditorView(editor);
+        if (!editorView || (editorView as any).destroyed) {
+            return null;
+        }
+
+        const activeCount = this.aiGeneratingSelectionRefCount.get(editorView) ?? 0;
+        if (activeCount === 0) {
+            this.applyAIGeneratingSelectionColors(editorView);
+            try {
+                editorView.dispatch({
+                    effects: setAIGeneratingSelectionEffect.of([{ from, to }]),
+                });
+            } catch (error) {
+                this.logDebug('Failed to start AI selection animation', error);
+                return null;
+            }
+        }
+
+        this.aiGeneratingSelectionRefCount.set(editorView, activeCount + 1);
+
+        let stopped = false;
+        return () => {
+            if (stopped) {
+                return;
+            }
+            stopped = true;
+
+            const currentCount = this.aiGeneratingSelectionRefCount.get(editorView);
+            if (!currentCount) {
+                return;
+            }
+
+            if (currentCount <= 1) {
+                this.aiGeneratingSelectionRefCount.delete(editorView);
+                if ((editorView as any).destroyed) {
+                    return;
+                }
+                try {
+                    editorView.dispatch({
+                        effects: clearAIGeneratingSelectionEffect.of(null),
+                    });
+                    editorView.dom.style.removeProperty('--virtual-linker-glossary-link-color');
+                } catch (error) {
+                    this.logDebug('Failed to stop AI selection animation', error);
+                }
+            } else {
+                this.aiGeneratingSelectionRefCount.set(editorView, currentCount - 1);
+            }
+        };
+    }
+
+    private forceLiveLinkerRefresh(editor: Editor): void {
+        const editorView = this.getCodeMirrorEditorView(editor);
+        if (!editorView || (editorView as any).destroyed) {
+            return;
+        }
+        try {
+            editorView.dispatch({
+                effects: forceLiveLinkerRefreshEffect.of(null),
+            });
+        } catch (error) {
+            this.logDebug('Failed to force live-link refresh', error);
+        }
+    }
+
+    private applyAIGeneratingSelectionColors(editorView: EditorView): void {
+        const virtualLinkColor = this.resolveVirtualLinkColor(editorView);
+        if (virtualLinkColor) {
+            editorView.dom.style.setProperty('--virtual-linker-glossary-link-color', virtualLinkColor);
+        }
+    }
+
+    private resolveVirtualLinkColor(editorView: EditorView): string | null {
+        const probeRoot = document.createElement('span');
+        probeRoot.classList.add('glossary-entry', 'virtual-link', 'virtual-link-span');
+        if (this.settings.applyDefaultLinkStyling) {
+            probeRoot.classList.add('virtual-link-default');
+        }
+        probeRoot.style.position = 'fixed';
+        probeRoot.style.opacity = '0';
+        probeRoot.style.pointerEvents = 'none';
+        probeRoot.style.left = '-9999px';
+        probeRoot.style.top = '-9999px';
+        probeRoot.style.whiteSpace = 'pre';
+
+        const probeLink = document.createElement('a');
+        probeLink.classList.add('internal-link', 'virtual-link-a');
+        probeLink.textContent = 'x';
+        probeRoot.appendChild(probeLink);
+        editorView.dom.appendChild(probeRoot);
+
+        const color = getComputedStyle(probeLink).color;
+        probeRoot.remove();
+
+        if (!color || color === 'rgba(0, 0, 0, 0)' || color === 'transparent') {
+            return null;
+        }
+        return color;
+    }
+
+    private getCodeMirrorEditorView(editor: Editor): EditorView | null {
+        const cmAny = (editor as any).cm;
+        const directView = cmAny as EditorView | undefined;
+        if (directView && typeof directView.dispatch === 'function' && directView.state && directView.dom) {
+            return directView;
+        }
+
+        const nestedView = cmAny?.cm as EditorView | undefined;
+        if (nestedView && typeof nestedView.dispatch === 'function' && nestedView.state && nestedView.dom) {
+            return nestedView;
+        }
+
+        return null;
     }
 
     private logDebug(message: string, details?: unknown) {
@@ -1827,9 +2019,11 @@ export default class LinkerPlugin extends Plugin {
         const absX = Math.abs(event.deltaX);
         const absY = Math.abs(event.deltaY);
         const isHorizontalGesture = absX >= 8 && absX > absY * 1.1;
+
         if (!isHorizontalGesture) {
-            if (Date.now() - this.lastSidebarSwipeEventAt > 180) {
-                this.resetSidebarSwipeGesture();
+            // If currently dragging but vertical scroll detected, finalize
+            if (this.sidebarSwipeState !== 'idle' && Date.now() - this.lastSidebarSwipeEventAt > 180) {
+                this.finishSidebarSwipe();
             }
             return;
         }
@@ -1837,64 +2031,148 @@ export default class LinkerPlugin extends Plugin {
         const target = event.target instanceof HTMLElement ? event.target : null;
         const scrollConsumer = this.findHorizontalScrollConsumer(target, event.deltaX);
         if (scrollConsumer) {
-            this.resetSidebarSwipeGesture();
-            this.logDebug('Ignored horizontal swipe because a container can consume horizontal scrolling', {
-                x: event.clientX,
-                deltaX: event.deltaX,
-                deltaY: event.deltaY,
-                consumer: scrollConsumer.className,
-            });
+            if (this.sidebarSwipeState !== 'idle') {
+                this.finishSidebarSwipe();
+            }
             return;
         }
 
         const now = Date.now();
-        if (now - this.lastSidebarSwipeEventAt > 180) {
-            this.resetSidebarSwipeGesture();
+        // If too long since last event, reset
+        if (this.sidebarSwipeState !== 'idle' && now - this.lastSidebarSwipeEventAt > 300) {
+            this.finishSidebarSwipe();
         }
         this.lastSidebarSwipeEventAt = now;
 
-        const direction: -1 | 1 = event.deltaX < 0 ? -1 : 1;
-        if (direction !== this.sidebarSwipeDirection) {
-            this.sidebarSwipeDirection = direction;
-            this.sidebarSwipeAccumulator = event.deltaX;
-            this.sidebarSwipeDirectionEventCount = 1;
-        } else {
-            this.sidebarSwipeAccumulator += event.deltaX;
-            this.sidebarSwipeDirectionEventCount += 1;
+        const rightSplit = this.getRightSplitElement();
+        if (!rightSplit) return;
+
+        const isCollapsed = this.isRightSidebarCollapsed();
+
+        // Start gesture if idle
+        if (this.sidebarSwipeState === 'idle') {
+            const swipingToOpen = event.deltaX < 0 && isCollapsed;
+            const swipingToClose = event.deltaX > 0 && !isCollapsed;
+
+            if (!swipingToOpen && !swipingToClose) return;
+
+            this.sidebarSwipeWasCollapsed = isCollapsed;
+
+            if (swipingToOpen) {
+                this.sidebarSwipeProgress = 0;
+                // Expand sidebar so its content renders, then offset it off-screen
+                this.expandRightSidebarDirect();
+                // Force layout so sidebar gets its natural width
+                void rightSplit.offsetWidth;
+            } else {
+                this.sidebarSwipeProgress = 1;
+            }
+
+            this.sidebarSwipeState = 'dragging';
+            rightSplit.classList.add('glossary-swipe-active');
+            // Apply initial transform
+            const initialTranslateX = (1 - this.sidebarSwipeProgress) * 100;
+            rightSplit.style.transform = `translateX(${initialTranslateX}%)`;
         }
 
-        const swipeStepThreshold = 220;
-        if (Math.abs(this.sidebarSwipeAccumulator) < swipeStepThreshold || this.sidebarSwipeDirectionEventCount < 3) {
+        // Calculate progress change (negative deltaX → swipe left → open → increase progress)
+        const sidebarWidth = rightSplit.offsetWidth || 300;
+        const progressDelta = -event.deltaX / sidebarWidth;
+        this.sidebarSwipeProgress = Math.max(0, Math.min(1, this.sidebarSwipeProgress + progressDelta));
+
+        // Apply transform: progress 0 = translateX(100%), progress 1 = translateX(0%)
+        const translateX = (1 - this.sidebarSwipeProgress) * 100;
+        rightSplit.style.transform = `translateX(${translateX}%)`;
+
+        event.preventDefault();
+        event.stopPropagation();
+
+        // Schedule snap when swipe gesture ends
+        if (this.sidebarSwipeEndTimeout) clearTimeout(this.sidebarSwipeEndTimeout);
+        this.sidebarSwipeEndTimeout = setTimeout(() => this.finishSidebarSwipe(), 150);
+    }
+
+    private finishSidebarSwipe(): void {
+        if (this.sidebarSwipeState === 'idle') return;
+
+        if (this.sidebarSwipeEndTimeout) {
+            clearTimeout(this.sidebarSwipeEndTimeout);
+            this.sidebarSwipeEndTimeout = null;
+        }
+
+        const rightSplit = this.getRightSplitElement();
+        if (!rightSplit) {
+            this.sidebarSwipeState = 'idle';
+            this.sidebarSwipeProgress = 0;
             return;
         }
 
-        const toggledSameDirectionRecently =
-            this.lastSidebarToggleDirection === direction &&
-            now - this.lastSidebarToggleAt < 700;
-        if (toggledSameDirectionRecently) {
-            this.sidebarSwipeAccumulator = direction * (swipeStepThreshold - 1);
-            return;
-        }
+        // Snap open if dragged past 35%, otherwise snap closed
+        const shouldBeOpen = this.sidebarSwipeProgress >= 0.35;
 
-        if (this.toggleRightSidebar()) {
-            this.lastSidebarToggleDirection = direction;
-            this.lastSidebarToggleAt = now;
-            this.sidebarSwipeAccumulator = 0;
-            this.logDebug('Toggled right sidebar via horizontal swipe step', {
-                x: event.clientX,
-                deltaX: event.deltaX,
-                deltaY: event.deltaY,
-                direction,
-            });
-            event.preventDefault();
-            event.stopPropagation();
+        // Animate snap
+        rightSplit.classList.remove('glossary-swipe-active');
+        rightSplit.classList.add('glossary-swipe-snapping');
+        rightSplit.style.transform = shouldBeOpen ? 'translateX(0%)' : 'translateX(100%)';
+
+        const cleanup = () => {
+            rightSplit.classList.remove('glossary-swipe-snapping');
+            rightSplit.style.transform = '';
+            if (!shouldBeOpen) {
+                this.collapseRightSidebarDirect();
+            }
+        };
+
+        const handleTransitionEnd = (e: TransitionEvent) => {
+            if (e.propertyName === 'transform') {
+                rightSplit.removeEventListener('transitionend', handleTransitionEnd);
+                cleanup();
+            }
+        };
+        rightSplit.addEventListener('transitionend', handleTransitionEnd);
+        // Fallback timeout in case transitionend doesn't fire
+        setTimeout(() => {
+            rightSplit.removeEventListener('transitionend', handleTransitionEnd);
+            cleanup();
+        }, 300);
+
+        this.logDebug('Sidebar swipe finished', {
+            progress: this.sidebarSwipeProgress.toFixed(2),
+            shouldBeOpen,
+            wasCollapsed: this.sidebarSwipeWasCollapsed,
+        });
+
+        this.sidebarSwipeState = 'idle';
+        this.sidebarSwipeProgress = 0;
+    }
+
+    private getRightSplitElement(): HTMLElement | null {
+        const rightSplit = (this.app.workspace as any)?.rightSplit;
+        if (rightSplit?.containerEl instanceof HTMLElement) {
+            return rightSplit.containerEl;
+        }
+        return document.querySelector('.workspace-split.mod-right-split') as HTMLElement | null;
+    }
+
+    private isRightSidebarCollapsed(): boolean {
+        const rightSplit = (this.app.workspace as any)?.rightSplit;
+        if (!rightSplit) return true;
+        if (typeof rightSplit.isCollapsed === 'function') return !!rightSplit.isCollapsed();
+        return !!rightSplit.collapsed;
+    }
+
+    private expandRightSidebarDirect(): void {
+        const rightSplit = (this.app.workspace as any)?.rightSplit;
+        if (rightSplit && typeof rightSplit.expand === 'function') {
+            rightSplit.expand();
         }
     }
 
-    private resetSidebarSwipeGesture(): void {
-        this.sidebarSwipeAccumulator = 0;
-        this.sidebarSwipeDirection = 0;
-        this.sidebarSwipeDirectionEventCount = 0;
+    private collapseRightSidebarDirect(): void {
+        const rightSplit = (this.app.workspace as any)?.rightSplit;
+        if (rightSplit && typeof rightSplit.collapse === 'function') {
+            rightSplit.collapse();
+        }
     }
 
     private findHorizontalScrollConsumer(start: HTMLElement | null, deltaX: number): HTMLElement | null {
@@ -2077,44 +2355,12 @@ export default class LinkerPlugin extends Plugin {
     }
 
     private toggleRightSidebar(): boolean {
-        const appAny = this.app as any;
-        const commands = appAny.commands;
-        const commandIds = ['workspace:toggle-right-sidebar', 'app:toggle-right-sidebar'];
-
-        if (commands?.executeCommandById) {
-            for (const id of commandIds) {
-                if (commands.commands?.[id]) {
-                    commands.executeCommandById(id);
-                    return true;
-                }
-            }
+        if (this.isRightSidebarCollapsed()) {
+            this.expandRightSidebarDirect();
+        } else {
+            this.collapseRightSidebarDirect();
         }
-
-        const rightSplit = (this.app.workspace as any)?.rightSplit;
-        if (!rightSplit) {
-            return false;
-        }
-
-        if (typeof rightSplit.toggle === 'function') {
-            rightSplit.toggle();
-            return true;
-        }
-
-        const isCollapsed = typeof rightSplit.isCollapsed === 'function'
-            ? !!rightSplit.isCollapsed()
-            : !!rightSplit.collapsed;
-
-        if (isCollapsed && typeof rightSplit.expand === 'function') {
-            rightSplit.expand();
-            return true;
-        }
-
-        if (!isCollapsed && typeof rightSplit.collapse === 'function') {
-            rightSplit.collapse();
-            return true;
-        }
-
-        return false;
+        return true;
     }
 
     private logMetadataDiagnosticsForActiveFile(): void {
@@ -2545,6 +2791,8 @@ export default class LinkerPlugin extends Plugin {
 
     onunload() {
         this.logDebug('Plugin unloading');
+        this.clearHubIntegrationBindings();
+        this.connectedHubApi = null;
         const mathLinksApi = this.getMathLinksApi();
         if (this.didAttachMathLinksApiRewriter && typeof mathLinksApi?.unregisterSourceRewriter === 'function') {
             mathLinksApi.unregisterSourceRewriter(this.mathLinksGlossaryRewriterId);
@@ -2562,6 +2810,11 @@ export default class LinkerPlugin extends Plugin {
     async loadSettings() {
         this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
 
+        const definitionModelUseId = this.settings.aiDefinitionModelUseId?.trim();
+        const metadataModelUseId = this.settings.aiMetadataModelUseId?.trim();
+        this.settings.aiDefinitionModelUseId = definitionModelUseId || GLOSSARY_DEFINITION_MODEL_USE.id;
+        this.settings.aiMetadataModelUseId = metadataModelUseId || GLOSSARY_METADATA_MODEL_USE.id;
+
         // Load markdown links from obsidian settings
         // At the moment obsidian does not provide a clean way to get the settings through an API
         // So we read the app.json settings file directly
@@ -2578,6 +2831,12 @@ export default class LinkerPlugin extends Plugin {
         const previousAntialiasPropertyName = this.settings.propertyNameAntialiases;
         this.logDebug('Updating settings', settings);
         Object.assign(this.settings, settings);
+        this.settings.aiDefinitionModelUseId = this.settings.aiDefinitionModelUseId?.trim() || GLOSSARY_DEFINITION_MODEL_USE.id;
+        this.settings.aiMetadataModelUseId = this.settings.aiMetadataModelUseId?.trim() || GLOSSARY_METADATA_MODEL_USE.id;
+
+        const definitionModelUseChanged = typeof settings.aiDefinitionModelUseId === 'string';
+        const metadataModelUseChanged = typeof settings.aiMetadataModelUseId === 'string';
+        const modelUseIdsChanged = definitionModelUseChanged || metadataModelUseChanged;
 
         const exactPropertyChanged =
             typeof settings.propertyNameExactMatchOnly === 'string' &&
@@ -2598,9 +2857,134 @@ export default class LinkerPlugin extends Plugin {
         await this.saveData(this.settings);
         this.updateManager.update();
 
+        if (modelUseIdsChanged) {
+            this.connectHubIntegration();
+        }
+
         if (exactPropertyChanged || antialiasPropertyChanged) {
             this.scheduleExactMatchBackfill();
         }
+    }
+
+    getHubApi(notifyIfMissing = false): AiProviderHubApi | null {
+        const pluginManager = (this.app as App & {
+            plugins?: { getPlugin: (id: string) => unknown };
+        }).plugins;
+
+        const plugin = (pluginManager?.getPlugin(HUB_PLUGIN_ID) ?? null) as AiProviderHubRuntime | null;
+
+        if (!plugin) {
+            if (notifyIfMissing) {
+                new Notice('AI Provider Hub is not enabled. Enable the ai-provider-hub addon first.');
+            }
+            return null;
+        }
+
+        const api = plugin.getApi?.() ?? plugin.api;
+
+        if (!api && notifyIfMissing) {
+            new Notice('AI Provider Hub API is unavailable. Update or reload the ai-provider-hub addon.');
+        }
+
+        return api ?? null;
+    }
+
+    getModelUseIdForFeature(feature: 'definition' | 'metadata'): string {
+        if (feature === 'metadata') {
+            return this.settings.aiMetadataModelUseId || GLOSSARY_METADATA_MODEL_USE.id;
+        }
+        return this.settings.aiDefinitionModelUseId || GLOSSARY_DEFINITION_MODEL_USE.id;
+    }
+
+    getModelUseSelection(feature: 'definition' | 'metadata'): HubModelCatalogItem | null {
+        const api = this.getHubApi(false);
+        if (!api) {
+            return null;
+        }
+        return api.getModelSelectionForUse(this.getModelUseIdForFeature(feature));
+    }
+
+    getModelUseLabel(feature: 'definition' | 'metadata'): string {
+        const selection = this.getModelUseSelection(feature);
+        if (!selection) {
+            return 'Not set';
+        }
+        return `${selection.model} (${selection.modelTypeDisplayName})`;
+    }
+
+    private connectHubIntegration(): void {
+        const api = this.getHubApi(false);
+
+        if (!api) {
+            if (this.connectedHubApi || this.hubRegistryUnsubscribe || this.aiModelUseUnregisters.length) {
+                this.clearHubIntegrationBindings();
+                this.connectedHubApi = null;
+                this.logDebug('Hub integration disconnected: hub API missing');
+            }
+            return;
+        }
+
+        if (api === this.connectedHubApi && this.hubRegistryUnsubscribe && this.aiModelUseUnregisters.length) {
+            return;
+        }
+
+        this.clearHubIntegrationBindings();
+        this.connectedHubApi = api;
+        this.registerModelUsesWithHub(api);
+        this.bindHubRegistryListener(api);
+        this.logDebug('Hub integration connected');
+    }
+
+    private bindHubRegistryListener(api: AiProviderHubApi): void {
+        this.hubRegistryUnsubscribe = api.onRegistryChanged(() => {
+            this.logDebug('Hub registry changed');
+        });
+    }
+
+    private registerModelUsesWithHub(api: AiProviderHubApi): void {
+        const registrations = [
+            {
+                id: this.getModelUseIdForFeature('definition'),
+                displayName: GLOSSARY_DEFINITION_MODEL_USE.displayName,
+                description: GLOSSARY_DEFINITION_MODEL_USE.description,
+            },
+            {
+                id: this.getModelUseIdForFeature('metadata'),
+                displayName: GLOSSARY_METADATA_MODEL_USE.displayName,
+                description: GLOSSARY_METADATA_MODEL_USE.description,
+            },
+        ];
+
+        const seen = new Set<string>();
+        for (const registration of registrations) {
+            const id = registration.id.trim();
+            if (!id || seen.has(id)) {
+                continue;
+            }
+            seen.add(id);
+
+            try {
+                const unregister = api.registerModelUse({
+                    id,
+                    displayName: registration.displayName,
+                    description: registration.description,
+                });
+                this.aiModelUseUnregisters.push(unregister);
+                this.logDebug('Registered model use with hub', { id });
+            } catch {
+                this.logDebug('Model use registration skipped', { id });
+            }
+        }
+    }
+
+    private clearHubIntegrationBindings(): void {
+        this.hubRegistryUnsubscribe?.();
+        this.hubRegistryUnsubscribe = null;
+
+        for (const unregister of this.aiModelUseUnregisters) {
+            unregister();
+        }
+        this.aiModelUseUnregisters = [];
     }
 
     /** Toggle body class for hiding frontmatter in hover preview */
@@ -3228,117 +3612,69 @@ class LinkerSettingTab extends PluginSettingTab {
             );
 
         if (this.plugin.settings.aiEnabled) {
-            // Provider selection dropdown
-            new Setting(containerEl)
-                .setName('AI Provider')
-                .setDesc('Select your AI provider.')
-                .addDropdown((dropdown) => {
-                    AI_PROVIDER_PRESETS.forEach(preset => {
-                        dropdown.addOption(preset.id, preset.name);
-                    });
-                    dropdown
-                        .setValue(this.plugin.settings.aiActiveProvider)
-                        .onChange(async (value) => {
-                            await this.plugin.updateSettings({ aiActiveProvider: value });
-                            this.display();
-                        });
-                });
+            const hubApi = this.plugin.getHubApi(false);
 
-            const activePreset = AI_PROVIDER_PRESETS.find(p => p.id === this.plugin.settings.aiActiveProvider);
-            const savedProvider = this.plugin.settings.aiProviders.find(p => p.id === this.plugin.settings.aiActiveProvider);
-            const currentConfig = savedProvider || (activePreset ? { ...activePreset, apiKey: '' } : null);
-
-            if (currentConfig) {
-                // Endpoint (editable for custom, readonly for presets)
+            if (!hubApi) {
                 new Setting(containerEl)
-                    .setName('API Endpoint')
-                    .setDesc('The API endpoint URL.')
-                    .addText((text) => {
-                        text
-                            .setPlaceholder('https://api.example.com/v1/chat/completions')
-                            .setValue(currentConfig.endpoint)
-                            .onChange(async (value) => {
-                                await this.updateProviderConfig({ endpoint: value });
-                            });
-                        if (this.plugin.settings.aiActiveProvider !== 'custom') {
-                            text.inputEl.style.opacity = '0.7';
-                        }
-                    });
-
-                // API Key
+                    .setName('AI Provider Hub')
+                    .setDesc('AI Provider Hub is required for AI generation. Enable the ai-provider-hub addon and configure at least one provider model there.');
+            } else {
+                const configuredModels = hubApi.getModelCatalog({ onlyConfigured: true }).length;
                 new Setting(containerEl)
-                    .setName('API Key')
-                    .setDesc('Your API key for authentication.')
-                    .addText((text) => {
-                        text
-                            .setPlaceholder('sk-... or your API key')
-                            .setValue(currentConfig.apiKey)
-                            .onChange(async (value) => {
-                                await this.updateProviderConfig({ apiKey: value });
-                            });
-                        text.inputEl.type = 'password';
-                    });
-
-                // Model with fetch button
-                const modelSetting = new Setting(containerEl)
-                    .setName('Model')
-                    .setDesc('The AI model to use. Click "Fetch" to load available models.');
-
-                let modelDropdown: any = null;
-                let modelInput: any = null;
-
-                modelSetting.addText((text) => {
-                    modelInput = text;
-                    text
-                        .setPlaceholder('gpt-4o-mini')
-                        .setValue(currentConfig.model)
-                        .onChange(async (value) => {
-                            await this.updateProviderConfig({ model: value });
-                        });
-                });
-
-                modelSetting.addButton((button) => {
-                    button
-                        .setButtonText('Fetch Models')
-                        .onClick(async () => {
-                            button.setButtonText('Loading...');
-                            button.setDisabled(true);
-
-                            const aiCreator = new AIEntryCreator(this.plugin.app, this.plugin.settings);
-                            const result = await aiCreator.fetchModels();
-
-                            if (result.success && result.models && result.models.length > 0) {
-                                // Show dropdown with models
-                                const modal = new ModelSelectModal(this.plugin.app, result.models, currentConfig.model, async (selected) => {
-                                    await this.updateProviderConfig({ model: selected });
-                                    if (modelInput) {
-                                        modelInput.setValue(selected);
-                                    }
-                                });
-                                modal.open();
-                            } else {
-                                new Notice(result.error || 'No models found');
-                            }
-
-                            button.setButtonText('Fetch Models');
-                            button.setDisabled(false);
-                        });
-                });
-
-                new Setting(containerEl)
-                    .setName('Max Output Tokens')
-                    .setDesc('Maximum number of tokens for the AI response. Increase this for models that do extended thinking (e.g. Gemini 3 Pro).')
-                    .addText((text) =>
-                        text
-                            .setValue(String(this.plugin.settings.aiMaxTokens))
-                            .onChange(async (value) => {
-                                const num = parseInt(value);
-                                if (!isNaN(num) && num > 0) {
-                                    await this.plugin.updateSettings({ aiMaxTokens: num });
-                                }
-                            })
-                    );
+                    .setName('AI Provider Hub')
+                    .setDesc(`Connected. Configured models: ${configuredModels}.`);
             }
+
+            new Setting(containerEl)
+                .setName('Definition model variable ID')
+                .setDesc('Model variable registered with AI Provider Hub for definition generation.')
+                .addText((text) =>
+                    text
+                        .setPlaceholder(GLOSSARY_DEFINITION_MODEL_USE.id)
+                        .setValue(this.plugin.settings.aiDefinitionModelUseId)
+                        .onChange(async (value) => {
+                            await this.plugin.updateSettings({
+                                aiDefinitionModelUseId: value.trim() || GLOSSARY_DEFINITION_MODEL_USE.id,
+                            });
+                            this.display();
+                        })
+                );
+
+            new Setting(containerEl)
+                .setName('Definition model selection')
+                .setDesc(`Current: ${this.plugin.getModelUseLabel('definition')}`)
+                .addButton((button) =>
+                    button
+                        .setButtonText('Choose')
+                        .onClick(() => this.openHubModelPicker(this.plugin.getModelUseIdForFeature('definition')))
+                )
+                .addExtraButton((button) =>
+                    button
+                        .setIcon('cross')
+                        .setTooltip('Clear model mapping')
+                        .onClick(async () => {
+                            const api = this.plugin.getHubApi(true);
+                            if (!api || !api.setModelUseBinding) {
+                                return;
+                            }
+                            await api.setModelUseBinding(this.plugin.getModelUseIdForFeature('definition'), '');
+                            this.display();
+                        })
+                );
+
+            new Setting(containerEl)
+                .setName('Max Output Tokens')
+                .setDesc('Maximum number of tokens for the AI response. Increase this for models that do extended thinking (e.g. Gemini 3 Pro).')
+                .addText((text) =>
+                    text
+                        .setValue(String(this.plugin.settings.aiMaxTokens))
+                        .onChange(async (value) => {
+                            const num = parseInt(value, 10);
+                            if (!isNaN(num) && num > 0) {
+                                await this.plugin.updateSettings({ aiMaxTokens: num });
+                            }
+                        })
+                );
 
             new Setting(containerEl)
                 .setName('System Prompt')
@@ -3380,14 +3716,39 @@ class LinkerSettingTab extends PluginSettingTab {
 
             if (this.plugin.settings.aiGenerateMetadata) {
                 new Setting(containerEl)
-                    .setName('Metadata Model')
-                    .setDesc('Model ID to use for metadata (e.g. "gemini-2.0-flash", "gpt-4o-mini"). Leave empty to use the main provider model.')
+                    .setName('Metadata model variable ID')
+                    .setDesc('Model variable registered with AI Provider Hub for metadata generation.')
                     .addText((text) =>
                         text
-                            .setPlaceholder('Same as main model')
-                            .setValue(this.plugin.settings.aiMetadataModel)
+                            .setPlaceholder(GLOSSARY_METADATA_MODEL_USE.id)
+                            .setValue(this.plugin.settings.aiMetadataModelUseId)
                             .onChange(async (value) => {
-                                await this.plugin.updateSettings({ aiMetadataModel: value });
+                                await this.plugin.updateSettings({
+                                    aiMetadataModelUseId: value.trim() || GLOSSARY_METADATA_MODEL_USE.id,
+                                });
+                                this.display();
+                            })
+                    );
+
+                new Setting(containerEl)
+                    .setName('Metadata model selection')
+                    .setDesc(`Current: ${this.plugin.getModelUseLabel('metadata')}`)
+                    .addButton((button) =>
+                        button
+                            .setButtonText('Choose')
+                            .onClick(() => this.openHubModelPicker(this.plugin.getModelUseIdForFeature('metadata')))
+                    )
+                    .addExtraButton((button) =>
+                        button
+                            .setIcon('cross')
+                            .setTooltip('Clear model mapping')
+                            .onClick(async () => {
+                                const api = this.plugin.getHubApi(true);
+                                if (!api || !api.setModelUseBinding) {
+                                    return;
+                                }
+                                await api.setModelUseBinding(this.plugin.getModelUseIdForFeature('metadata'), '');
+                                this.display();
                             })
                     );
 
@@ -3443,38 +3804,38 @@ class LinkerSettingTab extends PluginSettingTab {
         }
     }
 
-    /**
-     * Update the current provider configuration
-     */
-    private async updateProviderConfig(updates: Partial<AIProviderConfig>) {
-        const providerId = this.plugin.settings.aiActiveProvider;
-        const providers = [...this.plugin.settings.aiProviders];
-        const existingIndex = providers.findIndex(p => p.id === providerId);
-
-        const preset = AI_PROVIDER_PRESETS.find(p => p.id === providerId);
-        const base = existingIndex >= 0 ? providers[existingIndex] : (preset ? { ...preset, apiKey: '' } : null);
-
-        if (!base) return;
-
-        const updated = { ...base, ...updates };
-
-        if (existingIndex >= 0) {
-            providers[existingIndex] = updated;
-        } else {
-            providers.push(updated);
+    private openHubModelPicker(modelUseId: string): void {
+        const api = this.plugin.getHubApi(true);
+        if (!api) {
+            return;
         }
 
-        await this.plugin.updateSettings({ aiProviders: providers });
+        if (!api.setModelUseBinding) {
+            new Notice('Connected AI Provider Hub version does not expose setModelUseBinding().');
+            return;
+        }
+
+        const catalog = api.getModelCatalog({ onlyConfigured: true });
+        if (!catalog.length) {
+            new Notice('No configured models found in AI Provider Hub.');
+            return;
+        }
+
+        const currentModelKey = api.getModelSelectionForUse(modelUseId)?.key ?? '';
+        const modal = new HubModelSelectModal(this.app, catalog, currentModelKey, async (selected) => {
+            await api.setModelUseBinding?.(modelUseId, selected.key);
+            this.display();
+        });
+        modal.open();
     }
 }
 
-// Simple modal for model selection
-class ModelSelectModal extends Modal {
+class HubModelSelectModal extends Modal {
     constructor(
         app: App,
-        private models: string[],
-        private currentModel: string,
-        private onSelect: (model: string) => void
+        private catalog: HubModelCatalogItem[],
+        private currentModelKey: string,
+        private onSelect: (item: HubModelCatalogItem) => void
     ) {
         super(app);
     }
@@ -3499,32 +3860,37 @@ class ModelSelectModal extends Modal {
 
         const renderList = (filter: string) => {
             listContainer.empty();
-            const filtered = this.models.filter(m => m.toLowerCase().includes(filter.toLowerCase()));
+            const normalizedFilter = filter.toLowerCase();
+            const filtered = this.catalog.filter((catalogItem) => {
+                const label = `${catalogItem.model} (${catalogItem.modelTypeDisplayName})`.toLowerCase();
+                return label.includes(normalizedFilter);
+            });
 
-            filtered.forEach(model => {
-                const item = listContainer.createDiv({ cls: 'linker-model-item' });
-                item.style.padding = '8px';
-                item.style.cursor = 'pointer';
-                item.style.borderRadius = '4px';
-                if (model === this.currentModel) {
-                    item.style.backgroundColor = 'var(--interactive-accent)';
-                    item.style.color = 'var(--text-on-accent)';
+            filtered.forEach((catalogItem) => {
+                const label = `${catalogItem.model} (${catalogItem.modelTypeDisplayName})`;
+                const optionEl = listContainer.createDiv({ cls: 'linker-model-item' });
+                optionEl.style.padding = '8px';
+                optionEl.style.cursor = 'pointer';
+                optionEl.style.borderRadius = '4px';
+                if (catalogItem.key === this.currentModelKey) {
+                    optionEl.style.backgroundColor = 'var(--interactive-accent)';
+                    optionEl.style.color = 'var(--text-on-accent)';
                 }
-                item.textContent = model;
+                optionEl.textContent = label;
 
-                item.addEventListener('click', () => {
-                    this.onSelect(model);
+                optionEl.addEventListener('click', () => {
+                    this.onSelect(catalogItem);
                     this.close();
                 });
 
-                item.addEventListener('mouseenter', () => {
-                    if (model !== this.currentModel) {
-                        item.style.backgroundColor = 'var(--background-modifier-hover)';
+                optionEl.addEventListener('mouseenter', () => {
+                    if (catalogItem.key !== this.currentModelKey) {
+                        optionEl.style.backgroundColor = 'var(--background-modifier-hover)';
                     }
                 });
-                item.addEventListener('mouseleave', () => {
-                    if (model !== this.currentModel) {
-                        item.style.backgroundColor = '';
+                optionEl.addEventListener('mouseleave', () => {
+                    if (catalogItem.key !== this.currentModelKey) {
+                        optionEl.style.backgroundColor = '';
                     }
                 });
             });
