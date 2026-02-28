@@ -851,23 +851,21 @@ ${cleanDefinition.trim()}
             metadataPromise = this.generateMetadata(term, context);
         }
 
-        let definitionResult: AIGenerationResult = { success: false, error: 'Definition generation failed' };
-        try {
-            definitionResult = await definitionPromise;
-        } finally {
+        const definitionPromiseWithCallback = definitionPromise.finally(() => {
             try {
                 options.onDefinitionComplete?.();
             } catch (error) {
                 console.error('[AI] onDefinitionComplete callback failed', error);
             }
-        }
+        });
+
+        const [definitionResult, metadataResult] = await Promise.all([definitionPromiseWithCallback, metadataPromise]);
 
         if (!definitionResult.success || !definitionResult.definition) {
             new Notice(definitionResult.error || 'Failed to generate definition');
             return null;
         }
 
-        const metadataResult = await metadataPromise;
         const metadata = metadataResult || undefined;
         return this.createGlossaryEntry(term, definitionResult.definition, metadata);
     }
