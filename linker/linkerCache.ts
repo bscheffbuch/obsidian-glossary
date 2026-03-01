@@ -613,6 +613,58 @@ export class LinkerCache {
         this.cache.resetSearch();
     }
 
+    /**
+     * Returns true if the virtual linker's full matching logic would link
+     * `displayText` to `targetFile` (respecting all word-boundary, case, and
+     * antialias settings). Safe to call at any time — resets internal state.
+     */
+    matchesFile(displayText: string, targetFile: TFile, sourceFile: TFile | null): boolean {
+        this.reset();
+        const text = displayText;
+        const settings = this.settings;
+
+        for (let i = 0; i <= text.length; i) {
+            const codePoint = text.codePointAt(i)!;
+            const char = i < text.length ? String.fromCodePoint(codePoint) : '\n';
+
+            const isWordBoundary = PrefixTree.checkWordBoundary(char);
+            if (settings.matchAnyPartsOfWords || settings.matchBeginningOfWords || isWordBoundary) {
+                const nodes = this.cache.getCurrentMatchNodes(
+                    i,
+                    settings.excludeLinksToOwnNote ? sourceFile : null
+                );
+                for (const node of nodes) {
+                    if (!settings.matchAnyPartsOfWords) {
+                        if (
+                            settings.matchBeginningOfWords &&
+                            !node.startsAtWordBoundary &&
+                            settings.matchEndOfWords &&
+                            !isWordBoundary
+                        ) {
+                            continue;
+                        }
+                    }
+                    const filteredFiles = this.cache.filterFilesByMatchBoundaries(
+                        node.files,
+                        node.startsAtWordBoundary,
+                        isWordBoundary
+                    );
+                    if (filteredFiles.some((f) => f.path === targetFile.path)) {
+                        if (settings.antialiasesEnabled &&
+                            this.cache.isMatchExcludedByAntialias(text, node.start, node.end, filteredFiles)) {
+                            continue;
+                        }
+                        return true;
+                    }
+                }
+            }
+
+            this.cache.pushChar(char);
+            i += char.length;
+        }
+        return false;
+    }
+
     updateCache(force = false) {
         // force = true;
         if (!this.app?.workspace?.getActiveFile()) {

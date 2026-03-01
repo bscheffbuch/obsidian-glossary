@@ -210,6 +210,12 @@ class AutoLinkerPlugin implements PluginValue {
 
             // We also want to exclude links to files that are already linked by a real link
             const app = this.app;
+            const settings = this.settings;
+            const linkerCache = this.linkerCache;
+            // For virtualizeRealGlossaryLinks: track [[...]] outer ranges and collect glossary real links
+            let lastOuterInternalLinkFrom = -1;
+            let lastOuterInternalLinkTo = -1;
+            const virtualRealLinks: Array<{ from: number; to: number; linkText: string; file: TFile }> = [];
             syntaxTree(view.state).iterate({
                 from,
                 to,
@@ -233,6 +239,12 @@ class AutoLinkerPlugin implements PluginValue {
                         formattingIntervalTree.insert([node.from, node.to], 'virtual-link-highlight');
                     }
 
+                    // Track outer [[...]] link ranges for real-link virtualization
+                    if (type.includes('internal-link') && !type.includes('hmd-internal-link') && !type.includes('string')) {
+                        lastOuterInternalLinkFrom = node.from;
+                        lastOuterInternalLinkTo = node.to;
+                    }
+
                     for (const excludedType of excludedTypes) {
                         if (type.contains(excludedType)) {
                             excludedIntervalTree.insert([node.from, node.to]);
@@ -249,6 +261,25 @@ class AutoLinkerPlugin implements PluginValue {
                                     const linkedFile = app.metadataCache.getFirstLinkpathDest(text, mappedFile?.path ?? '');
                                     if (linkedFile) {
                                         explicitlyLinkedFiles.add(linkedFile);
+                                        // Collect for real-link virtualization
+                                        if (settings.virtualizeRealGlossaryLinks &&
+                                            lastOuterInternalLinkFrom >= 0 &&
+                                            lastOuterInternalLinkFrom >= from) {
+                                            const outerText = view.state.doc.sliceString(lastOuterInternalLinkFrom, lastOuterInternalLinkTo);
+                                            const innerStart = outerText.indexOf('[[');
+                                            const innerEnd = outerText.lastIndexOf(']]');
+                                            const innerContent = innerStart >= 0 && innerEnd > innerStart
+                                                ? outerText.slice(innerStart + 2, innerEnd)
+                                                : text;
+                                            const pipeIdx = innerContent.indexOf('|');
+                                            const displayText = pipeIdx >= 0 ? innerContent.slice(pipeIdx + 1).trim() : innerContent.trim();
+                                            virtualRealLinks.push({
+                                                from: lastOuterInternalLinkFrom,
+                                                to: lastOuterInternalLinkTo,
+                                                linkText: displayText,
+                                                file: linkedFile
+                                            });
+                                        }
                                     }
                                 }
                             });
@@ -296,6 +327,8 @@ class AutoLinkerPlugin implements PluginValue {
             // or if we want to fix the IME problem
             const lineStart = view.state.doc.lineAt(cursorPos).from;
             const lineEnd = view.state.doc.lineAt(cursorPos).to;
+
+            const decoItems: Array<{ from: number; to: number; widget: VirtualLinkWidget }> = [];
 
             matches.forEach((addition) => {
                 const [from, to] = [addition.from, addition.to];
@@ -345,16 +378,28 @@ class AutoLinkerPlugin implements PluginValue {
                         addition.formattingClasses = formattingClasses;
                     }
 
-                    builder.add(
-                        from,
-                        to,
-                        Decoration.replace({
-                            // widget: addition.widget,
-                            widget: new VirtualLinkWidget(addition),
-                        })
-                    );
+                    decoItems.push({ from, to, widget: new VirtualLinkWidget(addition) });
                 }
             });
+
+            // Add virtual link decorations for real links that the virtual linker
+            // would independently produce for the same display text and target file.
+            if (this.settings.virtualizeRealGlossaryLinks) {
+                for (const vrl of virtualRealLinks) {
+                    if (!linkerCache.matchesFile(vrl.linkText, vrl.file, mappedFile ?? null)) continue;
+                    const match = new VirtualMatch(this.app, id++, vrl.linkText, vrl.from, vrl.to, [vrl.file], false, false, this.settings);
+                    decoItems.push({ from: vrl.from, to: vrl.to, widget: new VirtualLinkWidget(match) });
+                }
+            }
+
+            // Sort by start position and add to builder in the required ascending order
+            decoItems.sort((a, b) => a.from !== b.from ? a.from - b.from : a.to - b.to);
+            let lastDecoTo = -1;
+            for (const item of decoItems) {
+                if (item.from < lastDecoTo) continue; // skip overlapping decorations
+                builder.add(item.from, item.to, Decoration.replace({ widget: item.widget }));
+                lastDecoTo = item.to;
+            }
         }
 
         return builder.finish();

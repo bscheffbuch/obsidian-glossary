@@ -124,145 +124,203 @@ export class GlossaryLinker extends MarkdownRenderChild {
             // if (nodeList.length != 0) console.log(tag, nodeList.length);
             for (let index = 0; index <= nodeList.length; index++) {
                 const item = index == nodeList.length ? this.containerEl : nodeList.item(index)!;
+                this.processItemTextNodes(item, linkedFiles, explicitlyLinkedFiles, sourceFile);
+            }
+        }
 
-                for (let childNodeIndex = 0; childNodeIndex < item.childNodes.length; childNodeIndex++) {
-                    const childNode = item.childNodes[childNodeIndex];
+        // Process callout title inner elements (not covered by the tag-based loop above)
+        this.containerEl.querySelectorAll('.callout-title-inner').forEach((el) => {
+            this.processItemTextNodes(el as HTMLElement, linkedFiles, explicitlyLinkedFiles, sourceFile);
+        });
 
-                    if (childNode.nodeType === Node.TEXT_NODE) {
-                        const parentEl = childNode.parentElement;
-                        if (!parentEl) {
-                            continue;
-                        }
-                        // Do not mutate text already inside anchor elements (including math-link anchors).
-                        if (parentEl.closest('a')) {
-                            continue;
-                        }
+        // Virtualize existing real links to glossary files
+        if (this.settings.virtualizeRealGlossaryLinks) {
+            this.virtualizeRealLinks(linkedFiles, sourceFile);
+        }
+    }
 
-                        let text = childNode.textContent || '';
-                        if (text.length === 0) continue;
+    private processItemTextNodes(
+        item: Element,
+        linkedFiles: Set<TFile>,
+        explicitlyLinkedFiles: Set<TFile>,
+        sourceFile: TFile | null
+    ): void {
+        for (let childNodeIndex = 0; childNodeIndex < item.childNodes.length; childNodeIndex++) {
+            const childNode = item.childNodes[childNodeIndex];
 
-                        this.linkerCache.reset();
-                        let matches: VirtualMatch[] = [];
+            if (childNode.nodeType === Node.TEXT_NODE) {
+                const parentEl = childNode.parentElement;
+                if (!parentEl) {
+                    continue;
+                }
+                // Do not mutate text already inside anchor elements (including math-link anchors).
+                if (parentEl.closest('a')) {
+                    continue;
+                }
 
-                        let id = 0;
+                let text = childNode.textContent || '';
+                if (text.length === 0) continue;
 
-                        // Iterate over every char in the text
-                        for (let i = 0; i <= text.length; i) {
-                            // Do this to get unicode characters as whole chars and not only half of them
-                            const codePoint = text.codePointAt(i)!;
-                            const char = i < text.length ? String.fromCodePoint(codePoint) : '\n';
+                this.linkerCache.reset();
+                let matches: VirtualMatch[] = [];
 
-                            // If we are at a word boundary, get the current fitting files
-                            const isWordBoundary = PrefixTree.checkWordBoundary(char); // , this.settings.wordBoundaryRegex
-                            if (this.settings.matchAnyPartsOfWords || this.settings.matchBeginningOfWords || isWordBoundary) {
-                                const currentNodes = this.linkerCache.cache.getCurrentMatchNodes(
-                                    i,
-                                    this.settings.excludeLinksToOwnNote ? sourceFile : null
-                                );
-                                if (currentNodes.length > 0) {
-                                    currentNodes.forEach((node) => {
-                                        // Check if we want to include this note based on the settings
-                                        if (!this.settings.matchAnyPartsOfWords) {
-                                            if (
-                                                this.settings.matchBeginningOfWords &&
-                                                !node.startsAtWordBoundary &&
-                                                this.settings.matchEndOfWords &&
-                                                !isWordBoundary
-                                            ) {
-                                                return;
-                                            }
-                                        }
+                let id = 0;
 
-                                        const nFrom = node.start;
-                                        const nTo = node.end;
-                                        const name = text.slice(nFrom, nTo);
+                // Iterate over every char in the text
+                for (let i = 0; i <= text.length; i) {
+                    // Do this to get unicode characters as whole chars and not only half of them
+                    const codePoint = text.codePointAt(i)!;
+                    const char = i < text.length ? String.fromCodePoint(codePoint) : '\n';
 
-                                        // TODO: Handle multiple files
-                                        // const file = node.files.values().next().value;
-
-                                        const filteredFiles = this.linkerCache.cache.filterFilesByMatchBoundaries(
-                                            node.files,
-                                            node.startsAtWordBoundary,
-                                            isWordBoundary
-                                        );
-                                        if (filteredFiles.length === 0) {
-                                            return;
-                                        }
-
-                                        const lowerFileBasenames = filteredFiles.map((file) => file.basename.toLowerCase());
-                                        const isAlias = !lowerFileBasenames.includes(name.toLowerCase());
-
-                                        matches.push(
-                                            new VirtualMatch(
-                                                this.app,
-                                                id++,
-                                                name,
-                                                nFrom,
-                                                nTo,
-                                                filteredFiles,
-                                                isAlias,
-                                                !isWordBoundary,
-                                                this.settings
-                                            )
-                                        );
-                                    });
+                    // If we are at a word boundary, get the current fitting files
+                    const isWordBoundary = PrefixTree.checkWordBoundary(char); // , this.settings.wordBoundaryRegex
+                    if (this.settings.matchAnyPartsOfWords || this.settings.matchBeginningOfWords || isWordBoundary) {
+                        const currentNodes = this.linkerCache.cache.getCurrentMatchNodes(
+                            i,
+                            this.settings.excludeLinksToOwnNote ? sourceFile : null
+                        );
+                        if (currentNodes.length > 0) {
+                            currentNodes.forEach((node) => {
+                                // Check if we want to include this note based on the settings
+                                if (!this.settings.matchAnyPartsOfWords) {
+                                    if (
+                                        this.settings.matchBeginningOfWords &&
+                                        !node.startsAtWordBoundary &&
+                                        this.settings.matchEndOfWords &&
+                                        !isWordBoundary
+                                    ) {
+                                        return;
+                                    }
                                 }
-                            }
 
-                            // Push the char to get the next nodes in the prefix tree
-                            this.linkerCache.cache.pushChar(char);
-                            i += char.length;
-                        }
+                                const nFrom = node.start;
+                                const nTo = node.end;
+                                const name = text.slice(nFrom, nTo);
 
-                        // Sort additions by from position
-                        matches = VirtualMatch.sort(matches);
+                                // TODO: Handle multiple files
+                                // const file = node.files.values().next().value;
 
-                        // Delete additions that links to already linked files
-                        if (this.settings.excludeLinksToRealLinkedFiles) {
-                            matches = VirtualMatch.filterAlreadyLinked(matches, explicitlyLinkedFiles);
-                        }
+                                const filteredFiles = this.linkerCache.cache.filterFilesByMatchBoundaries(
+                                    node.files,
+                                    node.startsAtWordBoundary,
+                                    isWordBoundary
+                                );
+                                if (filteredFiles.length === 0) {
+                                    return;
+                                }
 
-                        // Delete additions that links to already linked files
-                        if (this.settings.onlyLinkOnce) {
-                            matches = VirtualMatch.filterAlreadyLinked(matches, linkedFiles);
-                        }
-                        // Delete additions that overlap
-                        // Additions are sorted by from position and after that by length, we want to keep longer additions
-                        matches = VirtualMatch.filterOverlapping(matches, this.settings.onlyLinkOnce);
+                                const lowerFileBasenames = filteredFiles.map((file) => file.basename.toLowerCase());
+                                const isAlias = !lowerFileBasenames.includes(name.toLowerCase());
 
-                        // Filter out matches where the surrounding word is an antialias
-                        if (this.settings.antialiasesEnabled) {
-                            matches = matches.filter((match) => {
-                                return !this.linkerCache.cache.isMatchExcludedByAntialias(text, match.from, match.to, match.files);
+                                matches.push(
+                                    new VirtualMatch(
+                                        this.app,
+                                        id++,
+                                        name,
+                                        nFrom,
+                                        nTo,
+                                        filteredFiles,
+                                        isAlias,
+                                        !isWordBoundary,
+                                        this.settings
+                                    )
+                                );
                             });
                         }
-
-                        const parent = parentEl;
-                        let lastTo = 0;
-                        // console.log("Parent: ", parent);
-
-                        matches.forEach((match) => {
-                            match.files.forEach((f) => linkedFiles.add(f));
-
-                            const span = match.getCompleteLinkElement();
-
-                            if (match.from > 0) {
-                                parent?.insertBefore(document.createTextNode(text.slice(lastTo, match.from)), childNode);
-                            }
-
-                            parent?.insertBefore(span, childNode);
-                            lastTo = match.to;
-                        });
-
-                        const textLength = text.length;
-                        if (lastTo < textLength) {
-                            parent?.insertBefore(document.createTextNode(text.slice(lastTo)), childNode);
-                        }
-                        parent?.removeChild(childNode);
-                        childNodeIndex += 1;
                     }
+
+                    // Push the char to get the next nodes in the prefix tree
+                    this.linkerCache.cache.pushChar(char);
+                    i += char.length;
                 }
+
+                // Sort additions by from position
+                matches = VirtualMatch.sort(matches);
+
+                // Delete additions that links to already linked files
+                if (this.settings.excludeLinksToRealLinkedFiles) {
+                    matches = VirtualMatch.filterAlreadyLinked(matches, explicitlyLinkedFiles);
+                }
+
+                // Delete additions that links to already linked files
+                if (this.settings.onlyLinkOnce) {
+                    matches = VirtualMatch.filterAlreadyLinked(matches, linkedFiles);
+                }
+                // Delete additions that overlap
+                // Additions are sorted by from position and after that by length, we want to keep longer additions
+                matches = VirtualMatch.filterOverlapping(matches, this.settings.onlyLinkOnce);
+
+                // Filter out matches where the surrounding word is an antialias
+                if (this.settings.antialiasesEnabled) {
+                    matches = matches.filter((match) => {
+                        return !this.linkerCache.cache.isMatchExcludedByAntialias(text, match.from, match.to, match.files);
+                    });
+                }
+
+                const parent = parentEl;
+                let lastTo = 0;
+                // console.log("Parent: ", parent);
+
+                matches.forEach((match) => {
+                    match.files.forEach((f) => linkedFiles.add(f));
+
+                    const span = match.getCompleteLinkElement();
+
+                    if (match.from > 0) {
+                        parent?.insertBefore(document.createTextNode(text.slice(lastTo, match.from)), childNode);
+                    }
+
+                    parent?.insertBefore(span, childNode);
+                    lastTo = match.to;
+                });
+
+                const textLength = text.length;
+                if (lastTo < textLength) {
+                    parent?.insertBefore(document.createTextNode(text.slice(lastTo)), childNode);
+                }
+                parent?.removeChild(childNode);
+                childNodeIndex += 1;
             }
+        }
+    }
+
+    private virtualizeRealLinks(linkedFiles: Set<TFile>, sourceFile: TFile | null): void {
+        const anchors = Array.from(this.containerEl.querySelectorAll<HTMLAnchorElement>('a.internal-link'));
+        for (const a of anchors) {
+            // Skip if already inside a virtual link
+            if (a.closest('.virtual-link-span')) continue;
+
+            const href = a.getAttribute('data-href') || a.getAttribute('href') || '';
+            if (!href) continue;
+
+            const linkedFile = this.getClosestLinkPath(href);
+            if (!linkedFile) continue;
+
+            const displayText = a.textContent || '';
+            // Only virtualize if the virtual linker would independently match
+            // the display text to this exact file (same logic, case rules, antialiases, etc.)
+            if (!this.linkerCache.matchesFile(displayText, linkedFile, sourceFile)) continue;
+
+            // Wrap with virtual link styling
+            const wrapper = document.createElement('span');
+            wrapper.classList.add('glossary-entry', 'virtual-link', 'virtual-link-span');
+            if (this.settings.applyDefaultLinkStyling) {
+                wrapper.classList.add('virtual-link-default');
+            }
+            a.replaceWith(wrapper);
+            wrapper.appendChild(a);
+
+            // Add suffix icon
+            const isAlias = displayText.toLowerCase() !== linkedFile.basename.toLowerCase();
+            const suffix = isAlias ? this.settings.virtualLinkAliasSuffix : this.settings.virtualLinkSuffix;
+            if (suffix && suffix.length > 0) {
+                const icon = document.createElement('sup');
+                icon.textContent = suffix;
+                icon.classList.add('linker-suffix-icon');
+                wrapper.appendChild(icon);
+            }
+
+            linkedFiles.add(linkedFile);
         }
     }
 }

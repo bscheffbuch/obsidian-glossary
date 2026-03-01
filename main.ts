@@ -47,6 +47,7 @@ export interface LinkerPluginSettings {
     excludeLinksInCurrentLine: boolean;
     onlyLinkOnce: boolean;
     excludeLinksToRealLinkedFiles: boolean;
+    virtualizeRealGlossaryLinks: boolean;
     includeAliases: boolean;
     alwaysShowMultipleReferences: boolean;
     hideFrontmatterInHoverPreview: boolean;
@@ -180,6 +181,7 @@ const DEFAULT_SETTINGS: LinkerPluginSettings = {
     excludeLinksInCurrentLine: false,
     onlyLinkOnce: true,
     excludeLinksToRealLinkedFiles: true,
+    virtualizeRealGlossaryLinks: false,
     includeAliases: true,
     alwaysShowMultipleReferences: false,
     hideFrontmatterInHoverPreview: true,
@@ -657,6 +659,89 @@ export default class LinkerPlugin extends Plugin {
                     editor.replaceRange(replacement.text, fromPos, toPos);
                 }
             }
+        });
+
+        this.addCommand({
+            id: 'virtualize-real-glossary-links-active-note',
+            name: 'Convert Real Glossary Links to Virtual Links in Active Note',
+            callback: async () => {
+                const activeFile = this.app.workspace.getActiveFile();
+                if (!activeFile) {
+                    new Notice('No active file.');
+                    return;
+                }
+
+                const linkerCache = LinkerCache.getInstance(this.app, this.settings);
+                const sourcePath = activeFile.path;
+                let content = await this.app.vault.read(activeFile);
+                let count = 0;
+
+                // Split content into protected segments (frontmatter, fenced code blocks)
+                // and unprotected segments (regular markdown text), process only unprotected parts.
+                const segments: Array<{ text: string; protected: boolean }> = [];
+                let remaining = content;
+
+                // Protect frontmatter (--- ... --- at start of file)
+                const fmMatch = remaining.match(/^---\r?\n[\s\S]*?\n---\r?\n/);
+                if (fmMatch) {
+                    segments.push({ text: fmMatch[0], protected: true });
+                    remaining = remaining.slice(fmMatch[0].length);
+                }
+
+                // Protect fenced code blocks (``` or ~~~)
+                const codeFenceRe = /(```[^\n]*\n[\s\S]*?```|~~~[^\n]*\n[\s\S]*?~~~)/g;
+                let lastIdx = 0;
+                let fenceMatch: RegExpExecArray | null;
+                while ((fenceMatch = codeFenceRe.exec(remaining)) !== null) {
+                    if (fenceMatch.index > lastIdx) {
+                        segments.push({ text: remaining.slice(lastIdx, fenceMatch.index), protected: false });
+                    }
+                    segments.push({ text: fenceMatch[0], protected: true });
+                    lastIdx = codeFenceRe.lastIndex;
+                }
+                if (lastIdx < remaining.length) {
+                    segments.push({ text: remaining.slice(lastIdx), protected: false });
+                }
+
+                const processedSegments = segments.map((seg) => {
+                    if (seg.protected) return seg.text;
+
+                    // Replace wiki links: [[Target]], [[Target#heading]], [[Target|Display]], [[Target#heading|Display]]
+                    let text = seg.text.replace(/\[\[([^\[\]|#]+)(?:#[^\[\]|]*)?(?:\|([^\[\]]*))?\]\]/g, (match, target, pipeText) => {
+                        const resolvedBasename = (target.trim().split('/').pop() ?? target.trim()).replace(/\.md$/, '');
+                        const display = (pipeText !== undefined && pipeText.trim() !== '') ? pipeText.trim() : resolvedBasename;
+                        const linkedFile = this.app.metadataCache.getFirstLinkpathDest(getLinkpath(target.trim()), sourcePath);
+                        if (!linkedFile) return match;
+                        if (!linkerCache.matchesFile(display, linkedFile, activeFile)) return match;
+                        count++;
+                        return display;
+                    });
+
+                    // Replace markdown links (skip external URLs and image links):
+                    // [Display](path) but not ![alt](path)
+                    text = text.replace(/(?<!!)\[([^\[\]]+)\]\(([^()]+)\)/g, (match, displayText, href) => {
+                        const hrefTrimmed = href.trim();
+                        if (/^https?:\/\//i.test(hrefTrimmed) || /^[a-z][a-z0-9+\-.]*:\/\//i.test(hrefTrimmed)) return match;
+                        const linkedFile = this.app.metadataCache.getFirstLinkpathDest(getLinkpath(hrefTrimmed), sourcePath);
+                        if (!linkedFile) return match;
+                        const display = displayText.trim();
+                        if (!linkerCache.matchesFile(display, linkedFile, activeFile)) return match;
+                        count++;
+                        return display;
+                    });
+
+                    return text;
+                });
+
+                const newContent = processedSegments.join('');
+                if (count === 0) {
+                    new Notice('No convertible glossary links found in this note.');
+                    return;
+                }
+
+                await this.app.vault.modify(activeFile, newContent);
+                new Notice(`Converted ${count} link${count !== 1 ? 's' : ''} to virtual links.`);
+            },
         });
 
         // AI-powered glossary entry creation command
@@ -2767,6 +2852,16 @@ class LinkerSettingTab extends PluginSettingTab {
                     })
                 );
         }
+
+        // Virtualize real links to glossary files
+        new Setting(containerEl)
+            .setName('Virtualize real links to glossary entries')
+            .setDesc('When enabled, explicit wiki links [[...]] that point to glossary files are displayed with virtual link styling (including the suffix icon).')
+            .addToggle((toggle) =>
+                toggle.setValue(this.plugin.settings.virtualizeRealGlossaryLinks).onChange(async (value) => {
+                    await this.plugin.updateSettings({ virtualizeRealGlossaryLinks: value });
+                })
+            );
 
         // If headers should be matched or not
         new Setting(containerEl)
